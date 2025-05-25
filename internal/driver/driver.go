@@ -85,7 +85,7 @@ func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	if v == nil {
 		return nil, fmt.Errorf("unknown volume %s", r.Name)
 	}
-	device, opts, err := d.backend.Prepare(r.Name, r.Options)
+	   device, opts, err := d.backend.Prepare(r.Name, map[string]string{})
 	if err != nil {
 		return nil, err
 	}
@@ -100,4 +100,10 @@ func (d *Driver) Unmount(r *volume.UnmountRequest) error {
 	return exec.Command("umount", filepath.Join(mountRoot, r.Name)).Run()
 }
 
-// Get, List, Capabilities — omitted for brevity (same as previous version)
+func (d *Driver) Get(req *volume.GetRequest) (*volume.GetResponse, error) { /* … */ return nil, nil }
+func (d *Driver) List() (*volume.ListResponse, error)                     { /* … */ return nil, nil }
+func (d *Driver) Capabilities() *volume.CapabilitiesResponse {
+	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "global"}}
+}
+
+func optsToString(o []string) string { return fmt.Sprintf("%s", o) } // simple joiner for options

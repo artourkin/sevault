@@ -15,7 +15,7 @@ func main() {
 	h := volume.NewHandler(drv)
 	const sock = "/run/docker/plugins/sevault.sock"
 	log.Printf("starting Sevault plugin at %s", sock)
-	if err := h.ServeUnix("sevault", sock, 0); err != nil {
+	if err := h.ServeUnix(sock, 0); err != nil {
 		log.Fatal(err)
 	}
 }
