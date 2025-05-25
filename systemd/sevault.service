@@ -1,0 +1,12 @@
+[Unit]
+Description=Sevault Docker Volume Plugin
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStart=/usr/bin/sevaultd nfs cifs
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
