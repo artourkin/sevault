@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   sevault-plugin:
     build: .
@@ -8,3 +6,19 @@ services:
     volumes:
       - /run/docker/plugins:/run/docker/plugins
       - /var/lib/sevault:/var/lib/sevault
+    environment:
+      - LOG_LEVEL=debug
+
+  test-nfs-client:
+    image: alpine:3.20
+    depends_on:
+      - sevault-plugin
+    volumes:
+      - testvol:/mnt
+
+volumes:
+  testvol:
+    driver: sevault
+    driver_opts:
+      host: "127.0.0.1"
+      export: "/tmp"
