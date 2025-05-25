@@ -1,0 +1,11 @@
+version: "3.8"
+services:
+  sevault:
+    build: .
+    container_name: sevault
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /mnt:/mnt
+    environment:
+      - LOG_LEVEL=debug
