@@ -4,7 +4,7 @@ services:
     privileged: true
     network_mode: host
     volumes:
-      - /run/docker/plugins:/run/docker/plugins
+      #- /run/docker/plugins:/run/docker/plugins   # <-- THIS WONT WORK ON MACOS
       - /var/lib/sevault:/var/lib/sevault
     environment:
       - LOG_LEVEL=debug
