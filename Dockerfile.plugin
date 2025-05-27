@@ -1,12 +1,17 @@
-# Dockerfile.plugin  – produces a managed-plugin layer, not a normal OCI image
-################# build the static binary #################
+# Dockerfile.plugin ---------------------------------------------------
+# 1) build the Sevault binary
 FROM golang:1.22-alpine AS build
 WORKDIR /src
 COPY . .
-RUN CGO_ENABLED=0 go build -o sevaultd ./cmd/sevaultd
+RUN CGO_ENABLED=0 go build -o /sevaultd ./cmd/sevaultd
 
-################# build plugin rootfs ####################
-FROM scratch AS plugin-rootfs
-COPY --from=build /src/sevaultd  /sevaultd          # binary
-COPY --from=build /sbin/mount.nfs /sbin/mount.nfs    # needed for NFS
-# (add mount.cifs if you implement CIFS backend)
+# 2) copy mount.nfs from Alpine (needed inside plugin rootfs)
+FROM alpine:3.20 AS nfs-utils
+RUN apk add --no-cache nfs-utils
+
+# 3) final plugin rootfs
+FROM scratch
+# Sevault binary
+COPY --from=build /sevaultd            /sevaultd
+# mount helper for kernel NFS client
+COPY --from=nfs-utils /sbin/mount.nfs  /sbin/mount.nfs
