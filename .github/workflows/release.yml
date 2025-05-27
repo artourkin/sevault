@@ -19,6 +19,6 @@ jobs:
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --output type=docker-plugin,name=ghcr.io/${{ github.repository }}/sevault-plugin:${GITHUB_REF_NAME},alias=sevault \
+            --output type=docker-plugin,name=ghcr.io/${{ github.repository }}/sevault-plugin:${{ github.ref_name }},alias=sevault \
             --file Dockerfile.plugin \
             --push .
