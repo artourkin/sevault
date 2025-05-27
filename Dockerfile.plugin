@@ -15,3 +15,4 @@ FROM scratch
 COPY --from=build /sevaultd            /sevaultd
 # mount helper for kernel NFS client
 COPY --from=nfs-utils /sbin/mount.nfs  /sbin/mount.nfs
+ENTRYPOINT ["/sevaultd"] 
