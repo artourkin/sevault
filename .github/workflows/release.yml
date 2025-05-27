@@ -1,0 +1,24 @@
+name: plugin-release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU & Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push plugin
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --output type=docker-plugin,name=ghcr.io/${{ github.repository }}/sevault-plugin:${GITHUB_REF_NAME},alias=sevault \
+            --file Dockerfile.plugin \
+            --push .

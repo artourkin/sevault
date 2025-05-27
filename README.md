@@ -12,3 +12,33 @@ Kubernetes-only storage stacks like Longhorn or Ceph.
 | Plugin scope       | `global` (usable by all containers on the node)  |
 | Supported backends | NFS v3/v4, CIFS 3.x (SMB-encrypted), future SFTP |
 | License            | Apache-2.0                                       |
+
+
+
+
+# ASCII architecture diagram
+
+
+                       +-------------------------------------------+
+                       |              Remote Storage              |
+                       |   NFS v3/v4 server  |   CIFS/SMB 3.x      |
+                       +----------+----------+----------+----------+
+                                  ^                     ^
+                                  | NFS / SMB traffic   |
+                                  | (TCP 2049 / 445)    |
++-------------------+   Unix      |                     |
+|   Docker Engine   |   socket    |                     |
+|     (dockerd)     +-------------+---------------------+
++---------+---------+   /run/docker/plugins/sevault.sock
+          |
+          |  (Create/Mount/Unmount JSON calls)
+          v
++---------------------------+
+|   Sevault Plugin (SP)    |  executes mount(8) → kernel VFS
+|      container           |
+|   └─ backend: NFS/CIFS   |
++------------+-------------+
+             |
+             | bind-mount
+             v
+ /var/lib/sevault/mounts/<vol>   <-- seen inside user containers

@@ -57,7 +57,7 @@ func (d *Driver) Create(r *volume.CreateRequest) error {
 		return err
 	}
 	d.volumes[r.Name] = &volumeInfo{Name: r.Name, Path: path, Opts: r.Options}
-	log.Printf("[Create] Created volume %s at %s", r.Name, path)
+	log.Printf("[Create] Created volume %s at %s with Opts[%s]", r.Name, path, r.Options)
 	return nil
 }
 

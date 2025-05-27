@@ -1,0 +1,12 @@
+{
+  "description": "Sevault Volume Plugin",
+  "documentation": "https://github.com/YOUR_ORG/sevault",
+  "interface": { "socket": "sevault.sock", "types": ["docker.volumedriver/1.0"] },
+  "entrypoint": ["/sevaultd", "nfs", "cifs"],
+  "propagatedMount": "/var/lib/sevault/mounts",
+  "linux": { "capabilities": ["CAP_SYS_ADMIN"] },
+  "mounts": [
+    { "type": "bind", "source": "/var/lib/sevault", "destination": "/var/lib/sevault", "options": ["rbind","rw"] }
+  ],
+  "propagatedMountMode": "shared"
+}
