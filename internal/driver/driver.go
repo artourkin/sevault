@@ -32,6 +32,7 @@ type Driver struct {
 type volumeInfo struct {
 	Name string
 	Path string
+	Opts map[string]string
 }
 
 func New(b Backend) *Driver {
@@ -55,7 +56,7 @@ func (d *Driver) Create(r *volume.CreateRequest) error {
 		log.Printf("[Create] Failed to create directory %s: %v", path, err)
 		return err
 	}
-	d.volumes[r.Name] = &volumeInfo{Name: r.Name, Path: path}
+	d.volumes[r.Name] = &volumeInfo{Name: r.Name, Path: path, Opts: r.Options}
 	log.Printf("[Create] Created volume %s at %s", r.Name, path)
 	return nil
 }
@@ -94,7 +95,11 @@ func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 		log.Printf("[Mount] Unknown volume %s", r.Name)
 		return nil, fmt.Errorf("unknown volume %s", r.Name)
 	}
-	device, opts, err := d.backend.Prepare(r.Name, map[string]string{})
+	
+  
+  device, opts, err := d.backend.Prepare(r.Name, v.Opts)
+
+
 	if err != nil {
 		log.Printf("[Mount] Prepare failed for %s: %v", r.Name, err)
 		return nil, err
