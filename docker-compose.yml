@@ -1,18 +1,8 @@
 services:
-  sevault-plugin:
-    build: .
-    privileged: true
-    network_mode: host
-    volumes:
-      #- /run/docker/plugins:/run/docker/plugins   # <-- THIS WONT WORK ON MACOS
-      - /var/lib/sevault:/var/lib/sevault
-    environment:
-      - LOG_LEVEL=debug
-
   test-nfs-client:
     image: alpine:3.20
-    depends_on:
-      - sevault-plugin
+    # depends_on: # This should be removed or commented if sevault-plugin is removed
+      # - sevault-plugin #
     volumes:
       - testvol:/mnt
 

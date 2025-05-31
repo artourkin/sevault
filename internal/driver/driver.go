@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/artourkin/sevault/internal/backend"
 	"github.com/docker/go-plugins-helpers/volume"
 )
 
@@ -18,15 +19,17 @@ const (
 )
 
 // Backend is implemented by each storage back‑end (NFS, CIFS, …).
-type Backend interface {
-	Prepare(vol string, opts map[string]string) (device string, options []string, err error)
-	FSType() string
-}
+// This is now defined in internal/backend/backend.go, so we remove this local definition.
+// type Backend interface {
+// 	Prepare(vol string, opts map[string]string) (device string, options []string, err error)
+// 	FSType() string
+// }
 
 type Driver struct {
-	mu      sync.Mutex
-	volumes map[string]*volumeInfo
-	backend Backend
+	mu             sync.Mutex
+	volumes        map[string]*volumeInfo
+	backends       map[string]backend.Backend // Map of available backends
+	mountedVolumes map[string]backend.Backend // To track backend per volume
 }
 
 type volumeInfo struct {
@@ -35,10 +38,11 @@ type volumeInfo struct {
 	Opts map[string]string
 }
 
-func New(b Backend) *Driver {
+func New(b map[string]backend.Backend) *Driver {
 	return &Driver{
-		volumes: make(map[string]*volumeInfo),
-		backend: b,
+		volumes:        make(map[string]*volumeInfo),
+		backends:       b,
+		mountedVolumes: make(map[string]backend.Backend),
 	}
 }
 
@@ -51,13 +55,31 @@ func (d *Driver) Create(r *volume.CreateRequest) error {
 		log.Printf("[Create] Volume %s already exists", r.Name)
 		return nil
 	}
+
+	// Determine backend type
+	backendType := r.Options["type"]
+	if backendType == "" {
+		backendType = r.Options["backend"] // Also check for "backend"
+	}
+	if backendType == "" {
+		backendType = "nfs" // Default to NFS
+		log.Printf("[Create] No backend type specified for volume %s, defaulting to NFS", r.Name)
+	}
+
+	selectedBackend, ok := d.backends[backendType]
+	if !ok {
+		log.Printf("[Create] Backend type %s not found for volume %s", backendType, r.Name)
+		return fmt.Errorf("backend type %s not found", backendType)
+	}
+
 	path := filepath.Join(mountRoot, r.Name)
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		log.Printf("[Create] Failed to create directory %s: %v", path, err)
 		return err
 	}
 	d.volumes[r.Name] = &volumeInfo{Name: r.Name, Path: path, Opts: r.Options}
-	log.Printf("[Create] Created volume %s at %s with Opts[%s]", r.Name, path, r.Options)
+	d.mountedVolumes[r.Name] = selectedBackend // Store the selected backend
+	log.Printf("[Create] Created volume %s at %s with backend %s and Opts[%v]", r.Name, path, backendType, r.Options)
 	return nil
 }
 
@@ -95,16 +117,29 @@ func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 		log.Printf("[Mount] Unknown volume %s", r.Name)
 		return nil, fmt.Errorf("unknown volume %s", r.Name)
 	}
-	
-  
-  device, opts, err := d.backend.Prepare(r.Name, v.Opts)
 
+	backendToUse, ok := d.mountedVolumes[r.Name]
+	if !ok {
+		// If not found in mountedVolumes, try to infer or default.
+		// For now, default to NFS if available, otherwise error.
+		log.Printf("[Mount] Backend for volume %s not found in mountedVolumes, attempting to default to NFS", r.Name)
+		defaultBackend, foundNFS := d.backends["nfs"]
+		if !foundNFS {
+			log.Printf("[Mount] Default NFS backend not available for volume %s", r.Name)
+			return nil, fmt.Errorf("default nfs backend not available for volume %s", r.Name)
+		}
+		backendToUse = defaultBackend
+		// Optionally, store this inferred backend in mountedVolumes for future operations
+		// d.mountedVolumes[r.Name] = backendToUse
+	}
+
+	device, opts, err := backendToUse.Prepare(r.Name, v.Opts)
 
 	if err != nil {
 		log.Printf("[Mount] Prepare failed for %s: %v", r.Name, err)
 		return nil, err
 	}
-	mountArgs := []string{"-t", d.backend.FSType(), "-o", strings.Join(opts, ","), device, v.Path}
+	mountArgs := []string{"-t", backendToUse.FSType(), "-o", strings.Join(opts, ","), device, v.Path}
 	log.Printf("[Mount] Running: mount %s", strings.Join(mountArgs, " "))
 	if out, err := exec.Command("mount", mountArgs...).CombinedOutput(); err != nil {
 		log.Printf("[Mount] mount failed: %v (%s)", err, string(out))
@@ -126,10 +161,39 @@ func (d *Driver) Unmount(r *volume.UnmountRequest) error {
 	return err
 }
 
-func (d *Driver) Get(req *volume.GetRequest) (*volume.GetResponse, error) { /* … */ return nil, nil }
-func (d *Driver) List() (*volume.ListResponse, error)                     { /* … */ return nil, nil }
+func (d *Driver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	v, ok := d.volumes[req.Name]
+	if !ok {
+		log.Printf("[Get] Volume %s not found", req.Name)
+		return nil, fmt.Errorf("volume %s not found", req.Name)
+	}
+	log.Printf("[Get] Volume %s: Mountpoint: %s, Opts: %v", req.Name, v.Path, v.Opts)
+	statusMap := make(map[string]interface{})
+	for k, val := range v.Opts {
+		statusMap[k] = val
+	}
+	return &volume.GetResponse{Volume: &volume.Volume{Name: req.Name, Mountpoint: v.Path, Status: statusMap}}, nil
+}
+
+func (d *Driver) List() (*volume.ListResponse, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var vols []*volume.Volume
+	for name, v := range d.volumes {
+		statusMap := make(map[string]interface{})
+		for k, val := range v.Opts { // Assuming v.Opts is the correct source here for each volume in the loop
+			statusMap[k] = val
+		}
+		vols = append(vols, &volume.Volume{Name: name, Mountpoint: v.Path, Status: statusMap})
+	}
+	log.Printf("[List] Listed volumes: %v", vols)
+	return &volume.ListResponse{Volumes: vols}, nil
+}
+
 func (d *Driver) Capabilities() *volume.CapabilitiesResponse {
 	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "global"}}
 }
 
-func optsToString(o []string) string { return fmt.Sprintf("%s", o) } // simple joiner for options
+// func optsToString(o []string) string { return fmt.Sprintf("%s", o) } // This function is not used.

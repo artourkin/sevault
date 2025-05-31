@@ -1,0 +1,29 @@
+name: Plugin CI
+
+on:
+  push:
+    branches: [ main ] # Adjust if your main branch is named differently, e.g., master
+  pull_request:
+    branches: [ main ] # Adjust if your main branch is named differently
+
+jobs:
+  test-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # Should match the Go version used in Dockerfile.plugin
+
+      - name: Ensure test script is executable
+        run: chmod +x ./test-plugin.sh
+
+      - name: Run local test script
+        run: ./test-plugin.sh
+        # Add environment variables if needed by the script, e.g., for non-interactive execution
+        # env:
+        #   CI: true
+```

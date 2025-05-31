@@ -9,11 +9,11 @@ import (
 )
 
 func main() {
-	backend := &backend.NFS{}
-	drv := driver.New(backend)
+	availableBackends := map[string]backend.Backend{"nfs": &backend.NFS{}}
+	drv := driver.New(availableBackends)
 
 	h := volume.NewHandler(drv)
-	const sock = "/run/docker/plugins/sevault.sock"
+	const sock = "sevault.sock"
 	log.Printf("starting Sevault plugin at %s", sock)
 	if err := h.ServeUnix(sock, 0); err != nil {
 		log.Fatal(err)
