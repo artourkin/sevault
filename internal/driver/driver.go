@@ -170,7 +170,11 @@ func (d *Driver) Get(req *volume.GetRequest) (*volume.GetResponse, error) {
 		return nil, fmt.Errorf("volume %s not found", req.Name)
 	}
 	log.Printf("[Get] Volume %s: Mountpoint: %s, Opts: %v", req.Name, v.Path, v.Opts)
-	return &volume.GetResponse{Volume: &volume.Volume{Name: req.Name, Mountpoint: v.Path, Status: v.Opts}}, nil
+	statusMap := make(map[string]interface{})
+	for k, val := range v.Opts {
+		statusMap[k] = val
+	}
+	return &volume.GetResponse{Volume: &volume.Volume{Name: req.Name, Mountpoint: v.Path, Status: statusMap}}, nil
 }
 
 func (d *Driver) List() (*volume.ListResponse, error) {
@@ -178,7 +182,11 @@ func (d *Driver) List() (*volume.ListResponse, error) {
 	defer d.mu.Unlock()
 	var vols []*volume.Volume
 	for name, v := range d.volumes {
-		vols = append(vols, &volume.Volume{Name: name, Mountpoint: v.Path, Status: v.Opts})
+		statusMap := make(map[string]interface{})
+		for k, val := range v.Opts { // Assuming v.Opts is the correct source here for each volume in the loop
+			statusMap[k] = val
+		}
+		vols = append(vols, &volume.Volume{Name: name, Mountpoint: v.Path, Status: statusMap})
 	}
 	log.Printf("[List] Listed volumes: %v", vols)
 	return &volume.ListResponse{Volumes: vols}, nil
