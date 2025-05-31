@@ -130,11 +130,10 @@ echo "INFO: Waiting for NFS server to start (approx 10-15s)..."
 NFS_SERVER_READY=0
 for i in {1..15}; do
     # Check logs for a specific message indicating readiness
-    if docker logs ${NFS_SERVER_NAME} 2>&1 | grep -q "NFS server started"; then # erichough/nfs-server specific
+    if docker logs ${NFS_SERVER_NAME} 2>&1 | grep -q "SERVER STARTUP COMPLETE"; then # Corrected readiness check
         NFS_SERVER_READY=1
         break
     fi
-    # Fallback check: container is running and NFS port is listening (more complex, skip for now)
     echo "INFO: Still waiting for NFS server... (${i}s)"
     sleep 1
 done
