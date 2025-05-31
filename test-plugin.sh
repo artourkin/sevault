@@ -3,7 +3,17 @@ set -eo pipefail # Exit on error, treat unset variables as an error, and propaga
 
 cleanup() {
     echo "INFO: Running cleanup..."
-    docker-compose -f docker-compose.yml down --volumes 2>/dev/null || true # Stop test client
+    # Use docker compose v2 syntax
+    if command -v docker && docker compose version >/dev/null 2>&1; then
+        docker compose -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
+    elif command -v docker-compose && docker-compose --version >/dev/null 2>&1; then # Fallback for v1
+        docker-compose -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
+    fi
+
+    if [ -f "./docker-compose.test.yml" ]; then
+        echo "INFO: Removing temporary docker-compose.test.yml..."
+        rm -f ./docker-compose.test.yml
+    fi
     if docker ps -a --format '{{.Names}}' | grep -q '^test-nfs-server$'; then
         echo "INFO: Stopping and removing test-nfs-server container..."
         docker stop test-nfs-server 2>/dev/null || true
@@ -15,7 +25,7 @@ cleanup() {
     fi
     if [ -d "./nfs_share_test" ]; then
         echo "INFO: Removing local NFS share directory ./nfs_share_test..."
-        sudo rm -rf ./nfs_share_test # May require sudo if files were created as root by NFS
+        rm -rf ./nfs_share_test || sudo rm -rf ./nfs_share_test 2>/dev/null || true
     fi
     if docker plugin ls --format '{{.Name}}' | grep -q '^sevault$'; then
         echo "INFO: Disabling and removing sevault plugin..."
@@ -30,25 +40,42 @@ cleanup() {
         echo "INFO: Removing sevaultd binary..."
         rm -f ./sevaultd
     fi
-    # Remove the temporary compose file if it exists
-    if [ -f "./docker-compose.test.yml" ]; then
-        echo "INFO: Removing temporary docker-compose.test.yml..."
-        rm -f ./docker-compose.test.yml
-    fi
     echo "INFO: Cleanup finished."
 }
 
-trap cleanup EXIT # Register cleanup function to run on script exit (normal or error)
+trap cleanup EXIT
 
 # 0. Configuration
-NFS_IMAGE="erichough/nfs-server:latest" # Using a specific well-known image
+NFS_IMAGE_ALPINE="alpine:3.20"
+NFS_SERVER_IMAGE="erichough/nfs-server:latest" # Platform will be linux/amd64 for this image
 NFS_SERVER_NAME="test-nfs-server"
-NFS_EXPORT_DIR="/tmp/nfs_share_test_$(date +%s)" # Unique export dir for the server
-LOCAL_NFS_SHARE_DIR="./nfs_share_test" # Local dir to be mounted into NFS server
+LOCAL_NFS_SHARE_DIR="./nfs_share_test"
 PLUGIN_NAME="sevault"
 TEST_NETWORK_NAME="test-plugin-net"
 
+# Function to check and use correct docker compose command
+get_compose_cmd() {
+    if command -v docker && docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    elif command -v docker-compose && docker-compose --version >/dev/null 2>&1; then
+        echo "docker-compose"
+    else
+        echo "ERROR: Neither 'docker compose' (v2) nor 'docker-compose' (v1) found. Please install Docker Compose." >&2
+        exit 1
+    fi
+}
+COMPOSE_CMD_STR=$(get_compose_cmd)
+# Convert COMPOSE_CMD_STR to an array for easier execution
+read -r -a COMPOSE_CMD <<< "$COMPOSE_CMD_STR"
+
+
 echo "INFO: Starting local plugin test..."
+echo "INFO: Using Docker Compose command: ${COMPOSE_CMD_STR}"
+echo "INFO: Docker version:"
+docker --version
+echo "INFO: Docker Compose version:"
+"${COMPOSE_CMD[@]}" version
+
 
 # 1. Build sevaultd binary
 echo "INFO: Building sevaultd binary..."
@@ -61,15 +88,20 @@ echo "INFO: sevaultd binary built successfully."
 
 # 2. Prepare plugin package
 echo "INFO: Preparing Docker plugin package..."
-mkdir -p sevault-plugin-package/rootfs/sbin # Ensure sbin exists for mount helpers
+mkdir -p sevault-plugin-package/rootfs/sbin
 cp ./sevaultd sevault-plugin-package/rootfs/sevaultd
 
-#    Extract mount.nfs and mount.cifs from an Alpine image
-echo "INFO: Extracting mount.nfs and mount.cifs..."
-# Using --platform linux/amd64 for erichough/nfs-server to ensure compatibility on non-amd64 hosts for extraction
-docker run --rm --platform linux/amd64 --entrypoint /bin/sh "${NFS_IMAGE}" -c "tar -cC /sbin mount.nfs mount.cifs" | tar -vxf - -C sevault-plugin-package/rootfs/sbin/
+echo "INFO: Extracting mount.nfs and mount.cifs from ${NFS_IMAGE_ALPINE}..."
+EXTRACT_CONTAINER_NAME="mount-utils-extractor-$(date +%s)"
+# Use --platform linux/amd64 for alpine if running on ARM host to ensure x86_64 utils
+docker create --name ${EXTRACT_CONTAINER_NAME} --platform linux/amd64 ${NFS_IMAGE_ALPINE} /bin/sh -c \
+    "apk update >/dev/stderr && apk add --no-cache nfs-utils cifs-utils >/dev/stderr && ls -l /sbin/mount.* >/dev/stderr && tar -cC /sbin mount.nfs mount.cifs"
+docker start -a ${EXTRACT_CONTAINER_NAME} | tar -vxf - -C sevault-plugin-package/rootfs/sbin/
+docker rm ${EXTRACT_CONTAINER_NAME} > /dev/null
+
 if [ ! -f "sevault-plugin-package/rootfs/sbin/mount.nfs" ] || [ ! -f "sevault-plugin-package/rootfs/sbin/mount.cifs" ]; then
     echo "ERROR: Failed to extract mount.nfs or mount.cifs."
+    ls -l sevault-plugin-package/rootfs/sbin/
     exit 1
 fi
 cp plugin-config.json sevault-plugin-package/config.json
@@ -77,44 +109,49 @@ echo "INFO: Plugin package prepared."
 
 # 3. Setup Docker network
 echo "INFO: Setting up Docker network ${TEST_NETWORK_NAME}..."
-if ! docker network inspect "${TEST_NETWORK_NAME}" > /dev/null 2>&1; then
-    docker network create "${TEST_NETWORK_NAME}"
+if ! docker network inspect ${TEST_NETWORK_NAME} >/dev/null 2>&1; then
+    docker network create ${TEST_NETWORK_NAME}
 else
     echo "INFO: Network ${TEST_NETWORK_NAME} already exists."
 fi
 
-
 # 4. Start NFS Server
-echo "INFO: Starting NFS server container (${NFS_SERVER_NAME})..."
+echo "INFO: Starting NFS server container (${NFS_SERVER_NAME}) using ${NFS_SERVER_IMAGE}..."
 mkdir -p ${LOCAL_NFS_SHARE_DIR}
-# The erichough/nfs-server image needs SHARED_DIRECTORY to be set.
-# The path used for SHARED_DIRECTORY must exist within the container.
-# We mount our local share to /exports inside the container, and tell the image to share /exports.
-# Adding --platform linux/amd64 for erichough/nfs-server for wider compatibility
 docker run -d --name ${NFS_SERVER_NAME} \
-    --platform linux/amd64 \
     --network ${TEST_NETWORK_NAME} \
+    --platform linux/amd64 \
     -v "${PWD}/${LOCAL_NFS_SHARE_DIR}:/exports:rw" \
-    -e SHARED_DIRECTORY=/exports \
-    --cap-add SYS_ADMIN --cap-add NFS_SERVER \
+    -e NFS_EXPORT_0="/exports *(rw,sync,no_subtree_check,no_root_squash)" \
     --privileged \
-    ${NFS_IMAGE}
+    ${NFS_SERVER_IMAGE}
 
-# Wait for NFS server to be ready - simple sleep, could be more sophisticated
-echo "INFO: Waiting for NFS server to start..."
-sleep 10
-if ! docker ps --format '{{.Names}}' | grep -q "^${NFS_SERVER_NAME}$"; then
-    echo "ERROR: NFS Server container ${NFS_SERVER_NAME} failed to start or is not running."
+echo "INFO: Waiting for NFS server to start (approx 10-15s)..."
+NFS_SERVER_READY=0
+for i in {1..15}; do
+    # Check logs for a specific message indicating readiness
+    if docker logs ${NFS_SERVER_NAME} 2>&1 | grep -q "NFS server started"; then # erichough/nfs-server specific
+        NFS_SERVER_READY=1
+        break
+    fi
+    # Fallback check: container is running and NFS port is listening (more complex, skip for now)
+    echo "INFO: Still waiting for NFS server... (${i}s)"
+    sleep 1
+done
+
+if [ ${NFS_SERVER_READY} -eq 0 ]; then
+    echo "ERROR: NFS Server container ${NFS_SERVER_NAME} failed to start or become ready in time."
+    echo "NFS server logs:"
+    docker logs ${NFS_SERVER_NAME} --tail 50
+    exit 1
+fi
+NFS_SERVER_IP_IN_NETWORK=$(docker inspect -f "{{.NetworkSettings.Networks.${TEST_NETWORK_NAME}.IPAddress}}" ${NFS_SERVER_NAME})
+if [ -z "${NFS_SERVER_IP_IN_NETWORK}" ]; then
+    echo "ERROR: Could not determine NFS server IP address on network ${TEST_NETWORK_NAME}."
     docker logs ${NFS_SERVER_NAME}
     exit 1
 fi
-NFS_SERVER_IP=$(docker inspect -f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" ${NFS_SERVER_NAME})
-if [ -z "${NFS_SERVER_IP}" ]; then
-    echo "ERROR: Could not determine NFS server IP address."
-    docker logs ${NFS_SERVER_NAME}
-    exit 1
-fi
-echo "INFO: NFS server started. IP: ${NFS_SERVER_IP}, Exporting host dir ${LOCAL_NFS_SHARE_DIR} as /exports"
+echo "INFO: NFS server started. IP on ${TEST_NETWORK_NAME}: ${NFS_SERVER_IP_IN_NETWORK}"
 
 # 5. Install and Enable Plugin
 echo "INFO: Removing existing plugin (if any) and installing new one..."
@@ -132,64 +169,58 @@ fi
 echo "INFO: Plugin ${PLUGIN_NAME} installed and enabled."
 
 # 6. Run Test using Docker Compose
-#    Temporarily modify docker-compose.yml or use env vars if supported by compose file.
-#    For now, we'll create a temporary compose file with the correct host IP.
-echo "INFO: Preparing temporary docker-compose file for test..."
+echo "INFO: Preparing temporary docker-compose file (docker-compose.test.yml)..."
 cat > docker-compose.test.yml <<EOL
+version: '3.8'
 services:
   test-nfs-client:
     image: alpine:3.20
-    # network_mode: "container:${NFS_SERVER_NAME}" # Join NFS server's network to use localhost - alternative using network
-    network: "${TEST_NETWORK_NAME}"
-    depends_on:
-      - ${NFS_SERVER_NAME} # This is illustrative; direct container dependency not strictly needed here due to IP usage
+    networks:
+      - ${TEST_NETWORK_NAME}
     volumes:
       - testvol:/mnt
-    # Add a simple test command
     command: |
       sh -c "
-        # Wait a bit for volume to be ready, especially if NFS server is slow
-        sleep 5
-        echo 'Attempting to write to /mnt/testfile.txt...'
+        echo 'CLIENT: Waiting a bit for volume to be ready...'
+        sleep 3
+        echo 'CLIENT: Attempting to write to /mnt/testfile.txt...'
         touch /mnt/testfile.txt && \
-        echo 'Successfully created /mnt/testfile.txt.' && \
-        echo 'Test data' > /mnt/testfile.txt && \
-        echo 'Contents of /mnt/testfile.txt:' && \
+        echo 'CLIENT: Successfully created /mnt/testfile.txt.' && \
+        echo 'Test data from Sevault NFS volume' > /mnt/testfile.txt && \
+        echo 'CLIENT: Successfully wrote to /mnt/testfile.txt.' && \
+        echo 'CLIENT: Content of /mnt/testfile.txt:' && \
         cat /mnt/testfile.txt && \
-        echo 'Directory listing of /mnt:' && \
         ls -l /mnt && \
-        echo 'Test successful!' || \
-        (echo 'Test FAILED.' && exit 1)
+        echo 'CLIENT: Test successful!' || \
+        (echo 'CLIENT: Test FAILED.' && exit 1)
       "
 volumes:
   testvol:
     driver: ${PLUGIN_NAME}
     driver_opts:
-      host: "${NFS_SERVER_IP}" # Use the dynamically obtained IP of the NFS server
-      export: "/exports" # This is the path *inside* the NFS server container
-      # type: "nfs" # Optional, as it defaults to nfs
+      host: "${NFS_SERVER_IP_IN_NETWORK}"
+      export: "/exports"
+      type: "nfs"
+networks:
+  ${TEST_NETWORK_NAME}:
+    external: true
 EOL
 
-echo "INFO: Running Docker Compose test..."
-# The test-nfs-client will run, execute its command, and its exit code will determine success.
-# Using `docker-compose -f docker-compose.test.yml up --exit-code-from test-nfs-client`
-# ensures compose itself exits with the test container's code.
-docker-compose -f docker-compose.test.yml up --abort-on-container-exit --exit-code-from test-nfs-client
-
+echo "INFO: Running Docker Compose test (test-nfs-client)..."
+"${COMPOSE_CMD[@]}" -f docker-compose.test.yml up --abort-on-container-exit --exit-code-from test-nfs-client test-nfs-client
 COMPOSE_EXIT_CODE=$?
-# rm docker-compose.test.yml # Keep it for inspection if needed, cleanup trap will get it
 
 if [ ${COMPOSE_EXIT_CODE} -ne 0 ]; then
     echo "ERROR: Docker Compose test failed with exit code ${COMPOSE_EXIT_CODE}."
-    # Show logs from the client container for debugging
-    docker-compose -f docker-compose.test.yml logs test-nfs-client
+    # Get client logs if compose up failed
+    CLIENT_CONTAINER_ID=$("${COMPOSE_CMD[@]}" -f docker-compose.test.yml ps -q test-nfs-client)
+    if [ -n "${CLIENT_CONTAINER_ID}" ]; then
+      echo "test-nfs-client logs:"
+      docker logs ${CLIENT_CONTAINER_ID} --tail 50
+    fi
     exit 1
 fi
 
 echo "INFO: Docker Compose test successful."
 echo "INFO: Local plugin test completed successfully!"
-# Cleanup is handled by trap
-
 exit 0
-
-```
