@@ -5,14 +5,15 @@ WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -o /sevaultd ./cmd/sevaultd
 
-# 2) copy mount.nfs from Alpine (needed inside plugin rootfs)
-FROM alpine:3.20 AS nfs-utils
-RUN apk add --no-cache nfs-utils
+# 2) copy mount.nfs and mount.cifs from Alpine
+FROM alpine:3.20 AS nfs-cifs-utils
+RUN apk add --no-cache nfs-utils cifs-utils
 
 # 3) final plugin rootfs
 FROM scratch
 # Sevault binary
 COPY --from=build /sevaultd            /sevaultd
-# mount helper for kernel NFS client
-COPY --from=nfs-utils /sbin/mount.nfs  /sbin/mount.nfs
+# mount helpers for kernel NFS & CIFS clients
+COPY --from=nfs-cifs-utils /sbin/mount.nfs  /sbin/mount.nfs
+COPY --from=nfs-cifs-utils /sbin/mount.cifs /sbin/mount.cifs
 ENTRYPOINT ["/sevaultd"] 
