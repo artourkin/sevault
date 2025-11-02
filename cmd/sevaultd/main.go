@@ -9,7 +9,10 @@ import (
 )
 
 func main() {
-	availableBackends := map[string]backend.Backend{"nfs": &backend.NFS{}}
+	availableBackends := map[string]backend.Backend{
+		"nfs":  &backend.NFS{},
+		"cifs": &backend.CIFS{},
+	}
 	drv := driver.New(availableBackends)
 
 	h := volume.NewHandler(drv)

@@ -93,6 +93,7 @@ func (d *Driver) Remove(r *volume.RemoveRequest) error {
 	}
 	_ = os.RemoveAll(v.Path)
 	delete(d.volumes, r.Name)
+	delete(d.mountedVolumes, r.Name)
 	log.Printf("[Remove] Removed volume %s", r.Name)
 	return nil
 }
@@ -112,13 +113,13 @@ func (d *Driver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	d.mu.Lock()
 	v := d.volumes[r.Name]
+	backendToUse, ok := d.mountedVolumes[r.Name]
 	d.mu.Unlock()
 	if v == nil {
 		log.Printf("[Mount] Unknown volume %s", r.Name)
 		return nil, fmt.Errorf("unknown volume %s", r.Name)
 	}
 
-	backendToUse, ok := d.mountedVolumes[r.Name]
 	if !ok {
 		// If not found in mountedVolumes, try to infer or default.
 		// For now, default to NFS if available, otherwise error.
@@ -129,8 +130,9 @@ func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 			return nil, fmt.Errorf("default nfs backend not available for volume %s", r.Name)
 		}
 		backendToUse = defaultBackend
-		// Optionally, store this inferred backend in mountedVolumes for future operations
-		// d.mountedVolumes[r.Name] = backendToUse
+		d.mu.Lock()
+		d.mountedVolumes[r.Name] = backendToUse
+		d.mu.Unlock()
 	}
 
 	device, opts, err := backendToUse.Prepare(r.Name, v.Opts)

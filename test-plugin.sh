@@ -3,6 +3,8 @@ set -eo pipefail # Exit on error, treat unset variables as an error, and propaga
 
 cleanup() {
     echo "INFO: Running cleanup..."
+    local plugin_ref=${PLUGIN_NAME:-sevault}
+    local nfs_volume_ref=${NFS_EXPORT_VOLUME:-test-nfs-share-volume}
     # Use docker compose v2 syntax
     if command -v docker && docker compose version >/dev/null 2>&1; then
         docker compose -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
@@ -23,14 +25,18 @@ cleanup() {
         echo "INFO: Removing Docker network test-plugin-net..."
         docker network rm test-plugin-net 2>/dev/null || true
     fi
+    if docker volume inspect "${nfs_volume_ref}" >/dev/null 2>&1; then
+        echo "INFO: Removing Docker volume ${nfs_volume_ref}..."
+        docker volume rm "${nfs_volume_ref}" 2>/dev/null || true
+    fi
     if [ -d "./nfs_share_test" ]; then
-        echo "INFO: Removing local NFS share directory ./nfs_share_test..."
+        echo "INFO: Removing legacy local NFS share directory ./nfs_share_test..."
         rm -rf ./nfs_share_test || sudo rm -rf ./nfs_share_test 2>/dev/null || true
     fi
-    if docker plugin ls --format '{{.Name}}' | grep -q '^sevault$'; then
+    if docker plugin inspect "${plugin_ref}" >/dev/null 2>&1; then
         echo "INFO: Disabling and removing sevault plugin..."
-        docker plugin disable sevault 2>/dev/null || true
-        docker plugin rm sevault 2>/dev/null || true
+        docker plugin disable "${plugin_ref}" 2>/dev/null || true
+        docker plugin rm "${plugin_ref}" 2>/dev/null || true
     fi
     if [ -d "./sevault-plugin-package" ]; then
         echo "INFO: Removing plugin package directory..."
@@ -49,7 +55,7 @@ trap cleanup EXIT
 NFS_IMAGE_ALPINE="alpine:3.20"
 NFS_SERVER_IMAGE="erichough/nfs-server:latest" # Platform will be linux/amd64 for this image
 NFS_SERVER_NAME="test-nfs-server"
-LOCAL_NFS_SHARE_DIR="./nfs_share_test"
+NFS_EXPORT_VOLUME="sevault-test-nfs-share"
 PLUGIN_NAME="sevault"
 TEST_NETWORK_NAME="test-plugin-net"
 
@@ -117,11 +123,14 @@ fi
 
 # 4. Start NFS Server
 echo "INFO: Starting NFS server container (${NFS_SERVER_NAME}) using ${NFS_SERVER_IMAGE}..."
-mkdir -p ${LOCAL_NFS_SHARE_DIR}
+echo "INFO: Ensuring Docker volume ${NFS_EXPORT_VOLUME} exists for NFS exports..."
+if ! docker volume inspect "${NFS_EXPORT_VOLUME}" >/dev/null 2>&1; then
+    docker volume create "${NFS_EXPORT_VOLUME}" >/dev/null
+fi
 docker run -d --name ${NFS_SERVER_NAME} \
     --network ${TEST_NETWORK_NAME} \
     --platform linux/amd64 \
-    -v "${PWD}/${LOCAL_NFS_SHARE_DIR}:/exports:rw" \
+    -v "${NFS_EXPORT_VOLUME}:/exports:rw" \
     -e NFS_EXPORT_0="/exports *(rw,sync,no_subtree_check,no_root_squash)" \
     --privileged \
     ${NFS_SERVER_IMAGE}
@@ -144,7 +153,7 @@ if [ ${NFS_SERVER_READY} -eq 0 ]; then
     docker logs ${NFS_SERVER_NAME} --tail 50
     exit 1
 fi
-NFS_SERVER_IP_IN_NETWORK=$(docker inspect -f "{{.NetworkSettings.Networks.${TEST_NETWORK_NAME}.IPAddress}}" ${NFS_SERVER_NAME})
+NFS_SERVER_IP_IN_NETWORK=$(docker inspect -f '{{with index .NetworkSettings.Networks "'"${TEST_NETWORK_NAME}"'"}}{{.IPAddress}}{{end}}' "${NFS_SERVER_NAME}")
 if [ -z "${NFS_SERVER_IP_IN_NETWORK}" ]; then
     echo "ERROR: Could not determine NFS server IP address on network ${TEST_NETWORK_NAME}."
     docker logs ${NFS_SERVER_NAME}
@@ -154,15 +163,17 @@ echo "INFO: NFS server started. IP on ${TEST_NETWORK_NAME}: ${NFS_SERVER_IP_IN_N
 
 # 5. Install and Enable Plugin
 echo "INFO: Removing existing plugin (if any) and installing new one..."
-docker plugin disable ${PLUGIN_NAME} > /dev/null 2>&1 || true
-docker plugin rm ${PLUGIN_NAME} > /dev/null 2>&1 || true
+docker plugin disable "${PLUGIN_NAME}" > /dev/null 2>&1 || true
+docker plugin rm "${PLUGIN_NAME}" > /dev/null 2>&1 || true
 
 echo "INFO: Creating plugin from package ./sevault-plugin-package"
-docker plugin create ${PLUGIN_NAME} ./sevault-plugin-package
+docker plugin create "${PLUGIN_NAME}" ./sevault-plugin-package
 echo "INFO: Enabling plugin ${PLUGIN_NAME}..."
-docker plugin enable ${PLUGIN_NAME}
-if ! docker plugin ls --format '{{.Name}}: {{.Enabled}}' | grep -q "^${PLUGIN_NAME}: true$"; then
+docker plugin enable "${PLUGIN_NAME}"
+PLUGIN_ENABLED=$(docker plugin inspect -f '{{.Enabled}}' "${PLUGIN_NAME}" 2>/dev/null || true)
+if [ "${PLUGIN_ENABLED}" != "true" ]; then
     echo "ERROR: Plugin ${PLUGIN_NAME} not found or not enabled."
+    docker plugin ls
     exit 1
 fi
 echo "INFO: Plugin ${PLUGIN_NAME} installed and enabled."
