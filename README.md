@@ -1,255 +1,67 @@
-# Sevault – Docker‑Native Remote Volume Driver
+# Sevault – Minimal NFS Volume Driver
 
-> **Version 0.1 (May 2025)** – Apache‑2.0
+Sevault is a tiny Docker volume plugin that turns an existing NFS export into a Docker-managed volume. The current codebase intentionally keeps the feature set small so it is easy to audit and hack on—only NFS is supported, there is no clustering logic, and the plugin stores nothing beyond mountpoints.
 
-Sevault is a lightweight **Docker Volume Plugin** that turns ordinary **NFS v3/v4** and **SMB 3.x (CIFS)** shares into first‑class Docker volumes with automatic re‑mounting and zero Kubernetes dependence.
+## What You Get
+- Single static binary (`sevaultd`) compiled with Go 1.22
+- Works anywhere Docker can run managed plugins
+- Only two required inputs when creating a volume: `host` and `export`
 
-* **Single static binary** (`sevaultd`, ≈ 7 MB)
-* **Managed‑plugin install** (`docker plugin install …`)
-* Works with *docker run*, *Docker Compose*, and *Swarm*
-* Persists metadata in a tiny BoltDB file (`/var/lib/sevault/state.db`)
-* Soft‑mount options (`vers=4,soft,timeo=30`) provide graceful NAS outages
-
----
-
-## 1  Architecture (host view)
-
-```
-               ┌──────────────────────────────────────────┐
-               │              Remote Storage             │
-               │  NFS v4 or SMB 3.x server on LAN/WAN     │
-               └───────────────▲──────────▲──────────────┘
-                               │          │ (TCP 2049 / 445)
-                               │          │
-        docker.volumedriver ⇢  │          │  ⇠  kernel NFS/SMB client
-/run/docker/plugins/sevault.sock
-┌────────────────────────┐ socket JSON calls  ┌────────────────────────┐
-│        Dockerd         │───────────────────▶│      sevaultd          │
-│  (volume lifecycle)    │   Create/Mount     │  (plugin container)    │
-└───────────┬────────────┘                   └──────────┬─────────────┘
-            │  bind‑mount /var/lib/sevault/mounts/VOL   │ executes
-            │                                           │   mount(8)
-     ┌──────▼───────┐                                  │
-     │  Container   │  ⇠ bind ⇢ /var/lib/sevault/… ────┘
-     │   (app)      │
-     └──────────────┘
-```
-
-### Component table
-
-| Abbrev         | Process/Binary                                              | Purpose                                                                     |
-| -------------- | ----------------------------------------------------------- | --------------------------------------------------------------------------- |
-| **dockerd**    | Docker Engine                                               | Calls the VolumeDriver API on every `create`, `mount`, `unmount`, `remove`. |
-| **sevaultd**   | Static Go binary running **inside a managed‑plugin rootfs** | Implements the API, stores metadata, executes `mount.nfs`/`mount.cifs`.     |
-| **Remote NAS** | Any NFS/SMB server (containerised or hardware)              | Stores the actual data blocks.                                              |
-
----
-
-## 2  Docker Plugin: Build, Install, Use
-
-This section provides detailed instructions for building the Sevault Docker plugin from source, installing it, and using it to manage volumes.
-
-### 2.1 Building the Plugin
-
-The plugin is defined by `Dockerfile.plugin` (which assembles the root filesystem) and `plugin-config.json` (which provides metadata to Docker).
-
-**Steps to build the plugin package:**
-
-1.  **Build the `sevaultd` Go binary:**
-    This binary is the core of the plugin.
-    ```bash
-    CGO_ENABLED=0 go build -o sevaultd ./cmd/sevaultd
-    ```
-
-2.  **Prepare the plugin rootfs using `Dockerfile.plugin`:**
-    This step creates a temporary Docker image from `Dockerfile.plugin` and then extracts its contents to a local directory which will serve as the plugin's root filesystem.
-    ```bash
-    # Create a temporary builder image
-    docker build -t sevault-plugin-builder -f Dockerfile.plugin .
-
-    # Create an empty directory for the rootfs
-    mkdir -p plugin-rootfs
-
-    # Extract the contents from the builder image
-    docker container create --name temp_sevault_plugin sevault-plugin-builder
-    docker container export temp_sevault_plugin | tar -x -C plugin-rootfs
-    docker container rm temp_sevault_plugin
-    ```
-    The `plugin-rootfs` directory now contains the `sevaultd` binary and the necessary mount helpers (`mount.nfs`, `mount.cifs`).
-
-3.  **Assemble the plugin package:**
-    Docker requires a specific directory structure for plugin creation: a main directory containing `config.json` and a subdirectory named `rootfs`.
-    ```bash
-    # Create the main package directory
-    mkdir -p sevault-plugin-package
-
-    # Move the extracted rootfs into the package directory
-    mv plugin-rootfs sevault-plugin-package/rootfs
-
-    # Copy the plugin configuration file into the package directory, renaming it to config.json
-    cp plugin-config.json sevault-plugin-package/config.json
-    ```
-    You should now have a directory structure like this:
-    ```
-    sevault-plugin-package/
-    ├── config.json
-    └── rootfs/
-        ├── sevaultd
-        └── sbin/
-            ├── mount.cifs
-            └── mount.nfs
-    ```
-
-### 2.2 Installing and Managing the Plugin
-
-Once the plugin package is built and structured correctly:
-
-1.  **Navigate to the plugin package directory:**
-    ```bash
-    cd sevault-plugin-package
-    ```
-
-2.  **Create the plugin:**
-    This command tells Docker to register the plugin from the current directory (`.`).
-    ```bash
-    docker plugin create sevault .
-    ```
-    *Note: Replace `sevault` with `<your-dockerhub-username>/sevault` if you plan to push it to Docker Hub.*
-
-3.  **List plugins to verify installation:**
-    ```bash
-    docker plugin ls
-    ```
-    You should see `sevault` (or your namespaced version) in the list with `enabled: false`.
-
-4.  **Enable the plugin:**
-    Plugins must be enabled before they can be used.
-    ```bash
-    docker plugin enable sevault
-    ```
-
-5.  **Disable the plugin (when needed):**
-    ```bash
-    docker plugin disable sevault
-    ```
-
-6.  **Remove the plugin (when needed):**
-    Ensure the plugin is disabled before removing.
-    ```bash
-    docker plugin rm sevault
-    ```
-
-### 2.3 Using the Plugin
-
-Once the plugin is installed and enabled:
-
-1.  **Create a volume:**
-    Use `docker volume create` with the `-d sevault` driver option.
-    ```bash
-    docker volume create -d sevault --name mynfsvolume \
-      -o host=<nfs-server-ip> \
-      -o export=<export-path> \
-      # -o type=nfs # This is optional, defaults to nfs
-      # -o vers=4 # Also optional, defaults to 4 for NFS
-    ```
-
-2.  **Driver Options (`-o` or `driver_opts`):**
-    *   `host`: (Required) The IP address or hostname of the NFS/CIFS server.
-    *   `export`: (Required) The exported directory path on the server (e.g., `/srv/share`, `//server/share`).
-    *   `type`: (Optional) Specify the backend type. Currently, "nfs" is fully supported. "cifs" can be specified, and `mount.cifs` is included in the plugin's rootfs, but the driver logic for CIFS-specific options or mount procedures might be minimal initially. Defaults to "nfs" if not provided.
-    *   Other options (like `vers` for NFS) can also be passed and will be used by the respective mount helper if supported.
-
-3.  **Run a container with the volume:**
-    ```bash
-    docker run -it --rm -v mynfsvolume:/mnt/data alpine ash
-    ```
-    Inside the container, `/mnt/data` will be the mounted remote share.
-
-### 2.4 Testing with Docker Compose
-
-The `docker-compose.yml` file in the repository can be used to test the *installed and enabled* `sevault` plugin.
-
-1.  **Ensure the `sevault` plugin is installed and enabled** as described in section 2.2.
-2.  **Review `docker-compose.yml`:**
-    ```yaml
-    services:
-      test-nfs-client:
-        image: alpine:3.20
-        volumes:
-          - testvol:/mnt
-
-    volumes:
-      testvol:
-        driver: sevault
-        driver_opts:
-          host: "127.0.0.1" # Adjust if your NFS server is elsewhere
-          export: "/tmp"     # Adjust to match an actual export on your NFS server
-          # type: "nfs"      # Optional, defaults to nfs
-    ```
-3.  **Important Note on `driver_opts`:**
-    The default `driver_opts` in `docker-compose.yml` are `host: "127.0.0.1"` and `export: "/tmp"`. This implies you need an NFS server running on your local machine (the Docker host) and exporting its `/tmp` directory.
-    **You will likely need to adjust `host` and `export` to match your actual NFS server setup.** For example, if you have an NFS server at `192.168.1.100` exporting `/srv/data`:
-    ```yaml
-          host: "192.168.1.100"
-          export: "/srv/data"
-    ```
-
-4.  **Run Docker Compose:**
-    Once `docker-compose.yml` is configured for your environment:
-    ```bash
-    docker-compose up
-    ```
-    The `test-nfs-client` service will start, and Docker will attempt to provision the `testvol` using the `sevault` plugin and the specified `driver_opts`. You can then exec into the container to check `/mnt`.
-    ```bash
-    docker-compose exec test-nfs-client sh
-    # Inside the container:
-    # ls /mnt
-    # df -h
-    ```
-
-### 2.5 Running Local Tests
-
-The repository includes an end-to-end test script `test-plugin.sh` to verify the plugin's functionality locally.
-
-This script automates the following:
-*   Building the `sevaultd` binary.
-*   Packaging the Docker plugin, including extracting necessary `mount.nfs` and `mount.cifs` utilities.
-*   Starting a temporary NFS server in a Docker container.
-*   Installing and enabling the `sevault` plugin.
-*   Running a test Docker Compose application (`docker-compose.test.yml` generated by the script) that creates a volume using the `sevault` plugin, mounts it into a test client container, and performs a simple write/read operation.
-*   Cleaning up all resources (plugin, containers, networks, temporary files, and directories) upon completion or error.
-
-**Prerequisites:**
-*   Docker engine installed and running.
-*   Go programming environment (version matching the one in `Dockerfile.plugin`, e.g., 1.22) installed and correctly configured.
-*   Sufficient permissions to manage Docker resources and potentially for `sudo rm` if the script needs to clean up directories created by the NFS server (which might be owned by root).
-
-**To run the test script:**
+## Build the Binary
 ```bash
-./test-plugin.sh
+CGO_ENABLED=0 go build -o sevaultd ./cmd/sevaultd
 ```
-The script will output informational messages about its progress and will exit with a status code of 0 on success or non-zero on failure.
 
-**Note on `sudo` usage:** The script uses `sudo rm -rf ./nfs_share_test` during cleanup. If your user doesn't have passwordless sudo rights for `rm`, you might be prompted for a password at the end of the script execution (or if an error occurs and cleanup is triggered).
+## Package the Docker Plugin
+Use the provided multi-stage Dockerfile to assemble a root filesystem that contains the Sevault binary and the kernel `mount.nfs` helper:
+```bash
+docker build -t sevault-plugin-builder -f Dockerfile.plugin .
+mkdir -p sevault-plugin/rootfs
+docker container create --name sevault-plugin-stage sevault-plugin-builder
+docker container export sevault-plugin-stage | tar -x -C sevault-plugin/rootfs
+docker container rm sevault-plugin-stage
+cp plugin-config.json sevault-plugin/config.json
+```
 
----
+You now have a plugin package with this shape:
+```
+sevault-plugin/
+├── config.json
+└── rootfs/
+    ├── sevaultd
+    └── sbin/mount.nfs
+```
 
-## 3  Feature roadmap (summary)
+## Install & Enable
+```bash
+cd sevault-plugin
+docker plugin create sevault .
+docker plugin enable sevault
+```
 
-| Phase | Planned feature                                            |
-| ----- | ---------------------------------------------------------- |
-|  v0.2 | Web‑UI & REST on :8777 (volume list, metrics, logs)        |
-|  v0.3 | SFTP backend via `sshfs` adapter                           |
-|  v0.4 | S3/MinIO backend via `rclone mount --vfs-cache-mode write` |
-|  v0.5 | Multi‑node lock‑manager & volume replication               |
+## Use the Driver
+```bash
+docker volume create -d sevault \
+  --name data \
+  -o host=192.168.1.10 \
+  -o export=/srv/share \
+  -o vers=4 \
+  -o ro=false
 
----
+docker run -it --rm -v data:/mnt alpine ls /mnt
+```
 
-## 4  Project status & license
+### Supported Volume Options
+| Option  | Required | Description |
+| ------- | -------- | ----------- |
+| `host`  | ✅ | IPv4/IPv6 address or hostname of the NFS server. |
+| `export`| ✅ | Export path on the server (e.g. `/srv/share`). |
+| `vers`  | ❌ | NFS protocol version, defaults to `4`. |
+| `ro`    | ❌ | When set to `true`, Sevault mounts the export read-only. |
+| `options` | ❌ | Comma separated string passed straight to `mount.nfs`. |
 
-* **Status**: MVP ready for LAN production workloads (databases, CMS, CI caches).
-* **License**: Apache 2.0.  Contributions welcome via pull requests.
+All volumes mount under `/var/lib/sevault/mounts/<name>` on the host, and Docker bind-mounts that path into containers as needed.
 
----
-
-*Generated 2025‑05‑29.  This README is canonical—embed as‑is when sharing Sevault with other LLMs or documentation systems.*
+## Development Tips
+- Run `GOCACHE=$(pwd)/.gocache go test ./...` if your environment blocks writes to the default Go build cache.
+- `test-plugin.sh` provisions a throwaway NFS server, packages the plugin, installs it locally, and runs a quick end-to-end check.

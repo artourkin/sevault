@@ -24,3 +24,10 @@ go.work.sum
 # env file
 .env
 .DS_Store
+.cache
+
+# Local build artifacts
+sevaultd
+sevault-plugin/
+sevault-plugin-package/
+plugin-rootfs/

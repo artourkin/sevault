@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  nfs-server:
+    image: itsthenetwork/nfs-server-alpine:latest
+    container_name: nfs-server
+    privileged: true # needs /proc/fs exports
+    network_mode: host # export on host ports 111 & 2049
+    restart: unless-stopped
+    environment:
+      - SHARED_DIRECTORY=/srv/nfsdata
+    volumes:
+      - ./nfsdata:/srv/nfsdata # host dir becomes NFS export

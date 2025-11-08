@@ -7,9 +7,9 @@ cleanup() {
     local nfs_volume_ref=${NFS_EXPORT_VOLUME:-test-nfs-share-volume}
     # Use docker compose v2 syntax
     if command -v docker && docker compose version >/dev/null 2>&1; then
-        docker compose -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
+        docker compose --file docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
     elif command -v docker-compose && docker-compose --version >/dev/null 2>&1; then # Fallback for v1
-        docker-compose -f docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
+        docker-compose --file docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
     fi
 
     if [ -f "./docker-compose.test.yml" ]; then
@@ -97,16 +97,16 @@ echo "INFO: Preparing Docker plugin package..."
 mkdir -p sevault-plugin-package/rootfs/sbin
 cp ./sevaultd sevault-plugin-package/rootfs/sevaultd
 
-echo "INFO: Extracting mount.nfs and mount.cifs from ${NFS_IMAGE_ALPINE}..."
+echo "INFO: Extracting mount.nfs from ${NFS_IMAGE_ALPINE}..."
 EXTRACT_CONTAINER_NAME="mount-utils-extractor-$(date +%s)"
 # Use --platform linux/amd64 for alpine if running on ARM host to ensure x86_64 utils
 docker create --name ${EXTRACT_CONTAINER_NAME} --platform linux/amd64 ${NFS_IMAGE_ALPINE} /bin/sh -c \
-    "apk update >/dev/stderr && apk add --no-cache nfs-utils cifs-utils >/dev/stderr && ls -l /sbin/mount.* >/dev/stderr && tar -cC /sbin mount.nfs mount.cifs"
+    "apk update >/dev/stderr && apk add --no-cache nfs-utils >/dev/stderr && ls -l /sbin/mount.* >/dev/stderr && tar -cC /sbin mount.nfs"
 docker start -a ${EXTRACT_CONTAINER_NAME} | tar -vxf - -C sevault-plugin-package/rootfs/sbin/
 docker rm ${EXTRACT_CONTAINER_NAME} > /dev/null
 
-if [ ! -f "sevault-plugin-package/rootfs/sbin/mount.nfs" ] || [ ! -f "sevault-plugin-package/rootfs/sbin/mount.cifs" ]; then
-    echo "ERROR: Failed to extract mount.nfs or mount.cifs."
+if [ ! -f "sevault-plugin-package/rootfs/sbin/mount.nfs" ]; then
+    echo "ERROR: Failed to extract mount.nfs."
     ls -l sevault-plugin-package/rootfs/sbin/
     exit 1
 fi
@@ -166,6 +166,25 @@ echo "INFO: Removing existing plugin (if any) and installing new one..."
 docker plugin disable "${PLUGIN_NAME}" > /dev/null 2>&1 || true
 docker plugin rm "${PLUGIN_NAME}" > /dev/null 2>&1 || true
 
+STATE_ROOT="/var/lib/sevault"
+echo "INFO: Ensuring host state directory ${STATE_ROOT} exists for plugin mounts..."
+if [ ! -d "${STATE_ROOT}" ]; then
+    if mkdir -p "${STATE_ROOT}" 2>/dev/null; then
+        :
+    else
+        echo "INFO: Creating ${STATE_ROOT} requires elevated privileges. Trying sudo..."
+        sudo mkdir -p "${STATE_ROOT}"
+    fi
+fi
+if [ ! -d "${STATE_ROOT}/mounts" ]; then
+    if mkdir -p "${STATE_ROOT}/mounts" 2>/dev/null; then
+        :
+    else
+        echo "INFO: Creating ${STATE_ROOT}/mounts requires elevated privileges. Trying sudo..."
+        sudo mkdir -p "${STATE_ROOT}/mounts"
+    fi
+fi
+
 echo "INFO: Creating plugin from package ./sevault-plugin-package"
 docker plugin create "${PLUGIN_NAME}" ./sevault-plugin-package
 echo "INFO: Enabling plugin ${PLUGIN_NAME}..."
@@ -217,13 +236,13 @@ networks:
 EOL
 
 echo "INFO: Running Docker Compose test (test-nfs-client)..."
-"${COMPOSE_CMD[@]}" -f docker-compose.test.yml up --abort-on-container-exit --exit-code-from test-nfs-client test-nfs-client
+docker compose --file docker-compose.test.yml up --abort-on-container-exit test-nfs-client
 COMPOSE_EXIT_CODE=$?
 
 if [ ${COMPOSE_EXIT_CODE} -ne 0 ]; then
     echo "ERROR: Docker Compose test failed with exit code ${COMPOSE_EXIT_CODE}."
     # Get client logs if compose up failed
-    CLIENT_CONTAINER_ID=$("${COMPOSE_CMD[@]}" -f docker-compose.test.yml ps -q test-nfs-client)
+    CLIENT_CONTAINER_ID=$("${COMPOSE_CMD[@]}" --file docker-compose.test.yml ps -q test-nfs-client)
     if [ -n "${CLIENT_CONTAINER_ID}" ]; then
       echo "test-nfs-client logs:"
       docker logs ${CLIENT_CONTAINER_ID} --tail 50
