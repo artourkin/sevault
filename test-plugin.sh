@@ -1,20 +1,17 @@
 #!/bin/bash
 set -eo pipefail # Exit on error, treat unset variables as an error, and propagate pipeline failures
 
+COMPOSE_FILE_PATH="./tests/docker-compose.plugin-test.yml"
+
 cleanup() {
     echo "INFO: Running cleanup..."
     local plugin_ref=${PLUGIN_NAME:-sevault}
     local nfs_volume_ref=${NFS_EXPORT_VOLUME:-test-nfs-share-volume}
     # Use docker compose v2 syntax
     if command -v docker && docker compose version >/dev/null 2>&1; then
-        docker compose --file docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
+        docker compose --file "${COMPOSE_FILE_PATH}" down --volumes --remove-orphans 2>/dev/null || true
     elif command -v docker-compose && docker-compose --version >/dev/null 2>&1; then # Fallback for v1
-        docker-compose --file docker-compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
-    fi
-
-    if [ -f "./docker-compose.test.yml" ]; then
-        echo "INFO: Removing temporary docker-compose.test.yml..."
-        rm -f ./docker-compose.test.yml
+        docker-compose --file "${COMPOSE_FILE_PATH}" down --volumes --remove-orphans 2>/dev/null || true
     fi
     if docker ps -a --format '{{.Names}}' | grep -q '^test-nfs-server$'; then
         echo "INFO: Stopping and removing test-nfs-server container..."
@@ -53,6 +50,7 @@ trap cleanup EXIT
 
 # 0. Configuration
 NFS_IMAGE_ALPINE="alpine:3.20"
+TEST_NFS_CLIENT_IMAGE="alpine:3.20"
 NFS_SERVER_IMAGE="erichough/nfs-server:latest" # Platform will be linux/amd64 for this image
 NFS_SERVER_NAME="test-nfs-server"
 NFS_EXPORT_VOLUME="sevault-test-nfs-share"
@@ -198,51 +196,26 @@ fi
 echo "INFO: Plugin ${PLUGIN_NAME} installed and enabled."
 
 # 6. Run Test using Docker Compose
-echo "INFO: Preparing temporary docker-compose file (docker-compose.test.yml)..."
-cat > docker-compose.test.yml <<EOL
-version: '3.8'
-services:
-  test-nfs-client:
-    image: alpine:3.20
-    networks:
-      - ${TEST_NETWORK_NAME}
-    volumes:
-      - testvol:/mnt
-    command: |
-      sh -c "
-        echo 'CLIENT: Waiting a bit for volume to be ready...'
-        sleep 3
-        echo 'CLIENT: Attempting to write to /mnt/testfile.txt...'
-        touch /mnt/testfile.txt && \
-        echo 'CLIENT: Successfully created /mnt/testfile.txt.' && \
-        echo 'Test data from Sevault NFS volume' > /mnt/testfile.txt && \
-        echo 'CLIENT: Successfully wrote to /mnt/testfile.txt.' && \
-        echo 'CLIENT: Content of /mnt/testfile.txt:' && \
-        cat /mnt/testfile.txt && \
-        ls -l /mnt && \
-        echo 'CLIENT: Test successful!' || \
-        (echo 'CLIENT: Test FAILED.' && exit 1)
-      "
-volumes:
-  testvol:
-    driver: ${PLUGIN_NAME}
-    driver_opts:
-      host: "${NFS_SERVER_IP_IN_NETWORK}"
-      export: "/exports"
-      type: "nfs"
-networks:
-  ${TEST_NETWORK_NAME}:
-    external: true
-EOL
+if [ ! -f "${COMPOSE_FILE_PATH}" ]; then
+    echo "ERROR: Expected compose file ${COMPOSE_FILE_PATH} not found."
+    exit 1
+fi
+
+TESTS_NFS_EXPORT_PATH="/exports"
+export TESTS_PLUGIN_NAME="${PLUGIN_NAME}"
+export TESTS_NFS_SERVER_IP="${NFS_SERVER_IP_IN_NETWORK}"
+export TESTS_NFS_EXPORT_PATH
+export TESTS_NETWORK_NAME="${TEST_NETWORK_NAME}"
+export TESTS_CLIENT_IMAGE="${TEST_NFS_CLIENT_IMAGE}"
 
 echo "INFO: Running Docker Compose test (test-nfs-client)..."
-docker compose --file docker-compose.test.yml up --abort-on-container-exit test-nfs-client
+"${COMPOSE_CMD[@]}" --file "${COMPOSE_FILE_PATH}" up --abort-on-container-exit test-nfs-client
 COMPOSE_EXIT_CODE=$?
 
 if [ ${COMPOSE_EXIT_CODE} -ne 0 ]; then
     echo "ERROR: Docker Compose test failed with exit code ${COMPOSE_EXIT_CODE}."
     # Get client logs if compose up failed
-    CLIENT_CONTAINER_ID=$("${COMPOSE_CMD[@]}" --file docker-compose.test.yml ps -q test-nfs-client)
+    CLIENT_CONTAINER_ID=$("${COMPOSE_CMD[@]}" --file "${COMPOSE_FILE_PATH}" ps -q test-nfs-client)
     if [ -n "${CLIENT_CONTAINER_ID}" ]; then
       echo "test-nfs-client logs:"
       docker logs ${CLIENT_CONTAINER_ID} --tail 50
