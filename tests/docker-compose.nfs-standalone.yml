@@ -43,6 +43,8 @@ services:
 
   nfs-checker:
     image: ${TESTS_NFS_CHECKER_IMAGE:-alpine:3.20}
+    depends_on:
+      - nfs-client
     networks:
       - standalone-nfs-net
     volumes:
