@@ -25,21 +25,21 @@ services:
     command:
       - -c
       - |
-          set -eu
-          apk add --no-cache nfs-utils >/dev/null
+        set -eu
+        apk add --no-cache nfs-utils >/dev/null
           mount_dir=/mnt/test
-          mkdir -p "${mount_dir}"
-          echo "CLIENT: Mounting $${NFS_SERVER_HOST}:$${EXPORT_PATH}..."
-          mount -t nfs -o rw,vers=3,nolock "$${NFS_SERVER_HOST}:$${EXPORT_PATH}" "${mount_dir}"
-          echo "CLIENT: Writing $${CLIENT_TEST_FILE}..."
-          printf "Standalone NFS connectivity test %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${mount_dir}/$${CLIENT_TEST_FILE}"
-          sync
-          echo "CLIENT: Listing files in share:"
-          ls -l "${mount_dir}"
-          echo "CLIENT: Reading file contents:"
-          cat "${mount_dir}/$${CLIENT_TEST_FILE}"
-          umount "${mount_dir}"
-          echo "CLIENT: Unmounted successfully."
+          mkdir -p "$${mount_dir}"
+        echo "CLIENT: Mounting $${NFS_SERVER_HOST}:$${EXPORT_PATH}..."
+          mount -t nfs -o rw,vers=3,nolock "$${NFS_SERVER_HOST}:$${EXPORT_PATH}" "$${mount_dir}"
+        echo "CLIENT: Writing $${CLIENT_TEST_FILE}..."
+          printf "Standalone NFS connectivity test %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$${mount_dir}/$${CLIENT_TEST_FILE}"
+        sync
+        echo "CLIENT: Listing files in share:"
+          ls -l "$${mount_dir}"
+        echo "CLIENT: Reading file contents:"
+          cat "$${mount_dir}/$${CLIENT_TEST_FILE}"
+          umount "$${mount_dir}"
+        echo "CLIENT: Unmounted successfully."
 
   nfs-checker:
     image: ${TESTS_NFS_CHECKER_IMAGE:-alpine:3.20}
@@ -54,11 +54,11 @@ services:
     command:
       - -c
       - |
-          set -eu
-          echo "CHECKER: Listing $${EXPORT_PATH}..."
-          ls -l "$${EXPORT_PATH}"
-          echo "CHECKER: File contents:"
-          cat "$${EXPORT_PATH}/$${CLIENT_TEST_FILE}"
+        set -eu
+        echo "CHECKER: Listing $${EXPORT_PATH}..."
+        ls -l "$${EXPORT_PATH}"
+        echo "CHECKER: File contents:"
+        cat "$${EXPORT_PATH}/$${CLIENT_TEST_FILE}"
 
 networks:
   standalone-nfs-net:
