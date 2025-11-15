@@ -2,17 +2,21 @@ package driver
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/go-plugins-helpers/volume"
 )
 
 const (
-	stateRoot = "/var/lib/sevault"
-	mountRoot = stateRoot + "/mounts"
+	stateRoot       = "/var/lib/sevault"
+	mountRoot       = stateRoot + "/mounts"
+	mountRetryCount = 5
+	mountRetryDelay = time.Second
 )
 
 type Driver struct {
@@ -57,6 +61,7 @@ func (d *Driver) Create(r *volume.CreateRequest) error {
 	d.mu.Lock()
 	d.volumes[r.Name] = info
 	d.mu.Unlock()
+	log.Printf("registered volume %s host=%s export=%s", info.Name, info.Host, info.Export)
 	return nil
 }
 
@@ -97,14 +102,31 @@ func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	}
 
 	flags, data := prepareMountArgs(info.Options)
-	if err := mountVolume(info.Device, info.Path, "nfs", flags, data); err != nil {
-		return nil, err
+	log.Printf("mount request volume=%s device=%s target=%s opts=%s", info.Name, info.Device, info.Path, strings.Join(info.Options, ","))
+	var lastErr error
+	for attempt := 1; attempt <= mountRetryCount; attempt++ {
+		if err := mountVolume(info.Device, info.Path, "nfs", flags, data); err != nil {
+			lastErr = err
+			if attempt < mountRetryCount {
+				log.Printf("mount attempt %d/%d for %s failed: %v (retrying in %s)", attempt, mountRetryCount, info.Device, err, mountRetryDelay)
+				time.Sleep(mountRetryDelay)
+				continue
+			}
+			return nil, fmt.Errorf("mount %s -> %s failed: %w", info.Device, info.Path, err)
+		}
+		log.Printf("mount successful volume=%s target=%s", info.Name, info.Path)
+		return &volume.MountResponse{Mountpoint: info.Path}, nil
 	}
-	return &volume.MountResponse{Mountpoint: info.Path}, nil
+	return nil, lastErr
 }
 
 func (d *Driver) Unmount(r *volume.UnmountRequest) error {
-	return unmountVolume(filepath.Join(mountRoot, r.Name))
+	target := filepath.Join(mountRoot, r.Name)
+	if err := unmountVolume(target); err != nil {
+		return fmt.Errorf("unmount %s failed: %w", target, err)
+	}
+	log.Printf("unmounted volume=%s target=%s", r.Name, target)
+	return nil
 }
 
 func (d *Driver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
@@ -163,12 +185,21 @@ func buildMountOptions(host string, opts map[string]string) []string {
 		result = append(result, "ro")
 	}
 
+	hasNoLock := false
 	if extra := strings.TrimSpace(opts["options"]); extra != "" {
 		for _, part := range strings.Split(extra, ",") {
 			if trimmed := strings.TrimSpace(part); trimmed != "" {
+				if strings.EqualFold(trimmed, "nolock") {
+					hasNoLock = true
+				}
 				result = append(result, trimmed)
 			}
 		}
+	}
+
+	if !hasNoLock {
+		// Plugin rootfs does not run rpc.statd, so disable NLM locking by default.
+		result = append(result, "nolock")
 	}
 
 	return result

@@ -42,6 +42,7 @@ volumes:
     driver_opts:
       host: "${TESTS_NFS_SERVER_IP}"
       export: "${TESTS_NFS_EXPORT_PATH:-/exports}"
+      vers: "${TESTS_NFS_VERSION:-3}"
       type: "nfs"
 
 networks:
