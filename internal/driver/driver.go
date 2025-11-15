@@ -7,30 +7,30 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/docker/go-plugins-helpers/volume"
 )
 
-const (
-	stateRoot       = "/var/lib/sevault"
-	mountRoot       = stateRoot + "/mounts"
-	mountRetryCount = 5
-	mountRetryDelay = time.Second
-)
+const mountRoot = "/var/lib/sevault/mounts"
 
+// Driver is a tiny in-memory implementation of a Docker volume driver.
 type Driver struct {
 	mu      sync.Mutex
 	volumes map[string]*volumeInfo
 }
 
 type volumeInfo struct {
-	Name    string
-	Path    string
-	Device  string
-	Host    string
-	Export  string
-	Options []string
+	name       string
+	mountpoint string
+	device     string
+	config     mountConfig
+}
+
+type mountConfig struct {
+	host     string
+	export   string
+	version  string
+	readOnly bool
 }
 
 func New() *Driver {
@@ -38,30 +38,27 @@ func New() *Driver {
 }
 
 func (d *Driver) Create(r *volume.CreateRequest) error {
-	host := strings.TrimSpace(r.Options["host"])
-	export := strings.TrimSpace(r.Options["export"])
-	if host == "" || export == "" {
-		return fmt.Errorf("create requires host and export options")
+	cfg, err := parseMountConfig(r.Options)
+	if err != nil {
+		return err
 	}
 
-	path := filepath.Join(mountRoot, r.Name)
-	if err := os.MkdirAll(path, 0o755); err != nil {
+	mountpoint := filepath.Join(mountRoot, r.Name)
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return err
 	}
 
 	info := &volumeInfo{
-		Name:    r.Name,
-		Path:    path,
-		Device:  fmt.Sprintf("%s:%s", formatHost(host), export),
-		Host:    host,
-		Export:  export,
-		Options: buildMountOptions(host, r.Options),
+		name:       r.Name,
+		mountpoint: mountpoint,
+		device:     fmt.Sprintf("%s:%s", formatHost(cfg.host), cfg.export),
+		config:     cfg,
 	}
 
 	d.mu.Lock()
 	d.volumes[r.Name] = info
 	d.mu.Unlock()
-	log.Printf("registered volume %s host=%s export=%s", info.Name, info.Host, info.Export)
+	log.Printf("volume registered name=%s host=%s export=%s vers=%s ro=%t", r.Name, cfg.host, cfg.export, cfg.version, cfg.readOnly)
 	return nil
 }
 
@@ -74,78 +71,51 @@ func (d *Driver) Remove(r *volume.RemoveRequest) error {
 	if info == nil {
 		return nil
 	}
-
-	_ = os.RemoveAll(info.Path)
+	_ = os.RemoveAll(info.mountpoint)
 	return nil
 }
 
 func (d *Driver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
-	d.mu.Lock()
-	info := d.volumes[r.Name]
-	d.mu.Unlock()
-	if info == nil {
-		return nil, fmt.Errorf("volume %s not found", r.Name)
+	info, err := d.lookup(r.Name)
+	if err != nil {
+		return nil, err
 	}
-	return &volume.PathResponse{Mountpoint: info.Path}, nil
+	return &volume.PathResponse{Mountpoint: info.mountpoint}, nil
 }
 
 func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
-	d.mu.Lock()
-	info := d.volumes[r.Name]
-	d.mu.Unlock()
-	if info == nil {
-		return nil, fmt.Errorf("unknown volume %s", r.Name)
-	}
-
-	if err := os.MkdirAll(info.Path, 0o755); err != nil {
+	info, err := d.lookup(r.Name)
+	if err != nil {
 		return nil, err
 	}
 
-	flags, data := prepareMountArgs(info.Options)
-	log.Printf("mount request volume=%s device=%s target=%s opts=%s", info.Name, info.Device, info.Path, strings.Join(info.Options, ","))
-	var lastErr error
-	for attempt := 1; attempt <= mountRetryCount; attempt++ {
-		if err := mountVolume(info.Device, info.Path, "nfs", flags, data); err != nil {
-			lastErr = err
-			if attempt < mountRetryCount {
-				log.Printf("mount attempt %d/%d for %s failed: %v (retrying in %s)", attempt, mountRetryCount, info.Device, err, mountRetryDelay)
-				time.Sleep(mountRetryDelay)
-				continue
-			}
-			return nil, fmt.Errorf("mount %s -> %s failed: %w", info.Device, info.Path, err)
-		}
-		log.Printf("mount successful volume=%s target=%s", info.Name, info.Path)
-		return &volume.MountResponse{Mountpoint: info.Path}, nil
+	if err := os.MkdirAll(info.mountpoint, 0o755); err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+
+	flags, data := mountArguments(info.config)
+	if err := mountVolume(info.device, info.mountpoint, "nfs", flags, data); err != nil {
+		return nil, fmt.Errorf("mount %s -> %s failed: %w", info.device, info.mountpoint, err)
+	}
+	log.Printf("volume mounted name=%s target=%s", info.name, info.mountpoint)
+	return &volume.MountResponse{Mountpoint: info.mountpoint}, nil
 }
 
 func (d *Driver) Unmount(r *volume.UnmountRequest) error {
 	target := filepath.Join(mountRoot, r.Name)
 	if err := unmountVolume(target); err != nil {
-		return fmt.Errorf("unmount %s failed: %w", target, err)
+		return fmt.Errorf("unmount %s failed: %w", r.Name, err)
 	}
-	log.Printf("unmounted volume=%s target=%s", r.Name, target)
+	log.Printf("volume unmounted name=%s", r.Name)
 	return nil
 }
 
 func (d *Driver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
-	d.mu.Lock()
-	info := d.volumes[r.Name]
-	d.mu.Unlock()
-	if info == nil {
-		return nil, fmt.Errorf("volume %s not found", r.Name)
+	info, err := d.lookup(r.Name)
+	if err != nil {
+		return nil, err
 	}
-
-	status := map[string]interface{}{
-		"host":   info.Host,
-		"export": info.Export,
-	}
-	return &volume.GetResponse{Volume: &volume.Volume{
-		Name:       info.Name,
-		Mountpoint: info.Path,
-		Status:     status,
-	}}, nil
+	return &volume.GetResponse{Volume: describeVolume(info)}, nil
 }
 
 func (d *Driver) List() (*volume.ListResponse, error) {
@@ -154,15 +124,7 @@ func (d *Driver) List() (*volume.ListResponse, error) {
 
 	var volumes []*volume.Volume
 	for _, info := range d.volumes {
-		status := map[string]interface{}{
-			"host":   info.Host,
-			"export": info.Export,
-		}
-		volumes = append(volumes, &volume.Volume{
-			Name:       info.Name,
-			Mountpoint: info.Path,
-			Status:     status,
-		})
+		volumes = append(volumes, describeVolume(info))
 	}
 	return &volume.ListResponse{Volumes: volumes}, nil
 }
@@ -171,38 +133,63 @@ func (d *Driver) Capabilities() *volume.CapabilitiesResponse {
 	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "global"}}
 }
 
-func buildMountOptions(host string, opts map[string]string) []string {
-	var result []string
-	result = append(result, fmt.Sprintf("addr=%s", host))
+func (d *Driver) lookup(name string) (*volumeInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
-	vers := strings.TrimSpace(opts["vers"])
-	if vers == "" {
-		vers = "4"
+	info, ok := d.volumes[name]
+	if !ok {
+		return nil, fmt.Errorf("volume %s not found", name)
 	}
-	result = append(result, fmt.Sprintf("vers=%s", vers))
+	return info, nil
+}
 
-	if isTrue(opts["ro"]) {
-		result = append(result, "ro")
+func describeVolume(info *volumeInfo) *volume.Volume {
+	status := map[string]interface{}{
+		"host":   info.config.host,
+		"export": info.config.export,
+		"vers":   info.config.version,
+		"ro":     info.config.readOnly,
+	}
+	return &volume.Volume{
+		Name:       info.name,
+		Mountpoint: info.mountpoint,
+		Status:     status,
+	}
+}
+
+func parseMountConfig(opts map[string]string) (mountConfig, error) {
+	cfg := mountConfig{
+		host:     strings.TrimSpace(opts["host"]),
+		export:   strings.TrimSpace(opts["export"]),
+		version:  strings.TrimSpace(opts["vers"]),
+		readOnly: isTrue(opts["ro"]),
 	}
 
-	hasNoLock := false
-	if extra := strings.TrimSpace(opts["options"]); extra != "" {
-		for _, part := range strings.Split(extra, ",") {
-			if trimmed := strings.TrimSpace(part); trimmed != "" {
-				if strings.EqualFold(trimmed, "nolock") {
-					hasNoLock = true
-				}
-				result = append(result, trimmed)
-			}
-		}
+	if cfg.host == "" || cfg.export == "" {
+		return mountConfig{}, fmt.Errorf("host and export options are required")
 	}
 
-	if !hasNoLock {
-		// Plugin rootfs does not run rpc.statd, so disable NLM locking by default.
-		result = append(result, "nolock")
+	if cfg.version == "" {
+		cfg.version = "4"
 	}
 
-	return result
+	return cfg, nil
+}
+
+func mountArguments(cfg mountConfig) (uintptr, string) {
+	var flags uintptr
+	if cfg.readOnly {
+		flags |= mountFlagReadOnly
+	}
+
+	options := []string{
+		fmt.Sprintf("addr=%s", cfg.host),
+		fmt.Sprintf("vers=%s", cfg.version),
+		"nolock", // statd is not running inside the plugin rootfs
+	}
+
+	return flags, strings.Join(options, ",")
 }
 
 func formatHost(host string) string {
@@ -219,20 +206,4 @@ func isTrue(value string) bool {
 	default:
 		return false
 	}
-}
-
-func prepareMountArgs(opts []string) (uintptr, string) {
-	var flags uintptr
-	var extra []string
-	for _, opt := range opts {
-		switch strings.ToLower(strings.TrimSpace(opt)) {
-		case "ro":
-			flags |= mountFlagReadOnly
-		case "rw", "":
-			// ignore explicit rw markers or empty values
-		default:
-			extra = append(extra, opt)
-		}
-	}
-	return flags, strings.Join(extra, ",")
 }
