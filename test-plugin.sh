@@ -6,6 +6,7 @@ COMPOSE_FILE="${COMPOSE_FILE:-tests/docker-compose.plugin-test.yml}"
 PACKAGE_DIR="sevault-plugin-package"
 MOUNT_HELPER_IMAGE="${MOUNT_HELPER_IMAGE:-alpine:3.20}"
 GO_BUILDER_IMAGE="${GO_BUILDER_IMAGE:-golang:1.22-alpine}"
+REQUIRE_NFS_KERNEL_MODULE="${REQUIRE_NFS_KERNEL_MODULE:-true}"
 
 cleanup() {
     docker compose -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -57,8 +58,42 @@ install_plugin() {
     docker plugin enable "${PLUGIN_NAME}"
 }
 
+ensure_nfs_kernel_modules() {
+    if [ "${REQUIRE_NFS_KERNEL_MODULE}" != "true" ]; then
+        return
+    fi
+    local missing=()
+    for mod in nfs nfsd; do
+        if lsmod 2>/dev/null | awk '{print $1}' | grep -qx "${mod}"; then
+            continue
+        fi
+        info "Loading kernel module ${mod}..."
+        if modprobe "${mod}" 2>/dev/null; then
+            continue
+        fi
+        if command -v sudo >/dev/null 2>&1 && sudo modprobe "${mod}"; then
+            continue
+        fi
+        missing+=("${mod}")
+    done
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: Missing kernel modules: ${missing[*]} (try: sudo modprobe <module>)." >&2
+        exit 1
+    fi
+}
+
 start_nfs_stack() {
     info "Starting NFS server stack"
+    ensure_nfs_kernel_modules
+
+    export TESTS_NFS_SERVER_IMAGE="${TESTS_NFS_SERVER_IMAGE:-erichough/nfs-server:latest}"
+    export TESTS_NFS_EXPORT_VOLUME="${TESTS_NFS_EXPORT_VOLUME:-sevault-test-nfs-share}"
+    export TESTS_NFS_EXPORT_PATH="${TESTS_NFS_EXPORT_PATH:-/exports}"
+    export TESTS_NETWORK_NAME="${TESTS_NETWORK_NAME:-test-plugin-net}"
+    export TESTS_CLIENT_IMAGE="${TESTS_CLIENT_IMAGE:-alpine:3.20}"
+    export TESTS_PLUGIN_NAME="${PLUGIN_NAME}"
+    export TESTS_NFS_VERSION="${TESTS_NFS_VERSION:-3}"
+
     docker compose -f "${COMPOSE_FILE}" up -d test-nfs-server
     sleep 5
     local server_id
