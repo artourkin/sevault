@@ -65,3 +65,28 @@ All volumes mount under `/var/lib/sevault/mounts/<name>` on the host, and Docker
 ## Development Tips
 - Run `GOCACHE=$(pwd)/.gocache go test ./...` if your environment blocks writes to the default Go build cache.
 - `test-plugin.sh` provisions a throwaway NFS server, packages the plugin, installs it locally, and runs a quick end-to-end check.
+
+## WebUI (optional)
+A small Web UI is available to list/create/delete Sevault volumes through the Docker API.
+
+### Run on the host
+```bash
+CGO_ENABLED=0 go build -o webui ./cmd/webui
+PLUGIN_NAME=sevault WEBUI_ADDR=:8080 ./webui
+# open http://localhost:8080
+```
+
+### Run in Docker
+```bash
+docker build -t sevault-webui -f Dockerfile.webui .
+docker run --rm \
+  -p 8080:8080 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e PLUGIN_NAME=sevault \
+  sevault-webui
+# open http://localhost:8080
+```
+
+Notes:
+- The WebUI needs access to the Docker API socket to manage volumes.
+- It only manages volumes for the configured driver (`PLUGIN_NAME`, default `sevault`).

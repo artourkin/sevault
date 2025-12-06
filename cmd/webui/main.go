@@ -8,9 +8,12 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/volume"
+	"github.com/docker/docker/client"
 )
 
 const (
@@ -29,11 +32,15 @@ type volumeInfo struct {
 func main() {
 	addr := envOr("WEBUI_ADDR", defaultAddr)
 	pluginName := envOr("PLUGIN_NAME", defaultPluginName)
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		log.Fatalf("failed to init docker client: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndex(pluginName))
-	mux.HandleFunc("/api/volumes", volumesHandler(pluginName))
-	mux.HandleFunc("/api/volumes/", volumeHandler(pluginName))
+	mux.HandleFunc("/api/volumes", volumesHandler(cli, pluginName))
+	mux.HandleFunc("/api/volumes/", volumeHandler(cli, pluginName))
 
 	log.Printf("Sevault WebUI listening on %s (plugin=%s)", addr, pluginName)
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -61,20 +68,20 @@ func serveIndex(pluginName string) http.HandlerFunc {
 	}
 }
 
-func volumesHandler(pluginName string) http.HandlerFunc {
+func volumesHandler(cli *client.Client, pluginName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			listVolumes(w, pluginName)
+			listVolumes(w, cli, pluginName)
 		case http.MethodPost:
-			createVolume(w, r, pluginName)
+			createVolume(w, r, cli, pluginName)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	}
 }
 
-func volumeHandler(pluginName string) http.HandlerFunc {
+func volumeHandler(cli *client.Client, pluginName string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -85,7 +92,7 @@ func volumeHandler(pluginName string) http.HandlerFunc {
 			http.Error(w, "missing volume name", http.StatusBadRequest)
 			return
 		}
-		if err := dockerVolumeRm(name); err != nil {
+		if err := dockerVolumeRm(cli, name); err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -93,15 +100,15 @@ func volumeHandler(pluginName string) http.HandlerFunc {
 	}
 }
 
-func listVolumes(w http.ResponseWriter, pluginName string) {
-	names, err := dockerVolumeNames(pluginName)
+func listVolumes(w http.ResponseWriter, cli *client.Client, pluginName string) {
+	names, err := dockerVolumeNames(cli, pluginName)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	var vols []volumeInfo
 	for _, name := range names {
-		info, err := dockerVolumeInspect(name)
+		info, err := dockerVolumeInspect(cli, name)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("inspect %s: %v", name, err), http.StatusBadGateway)
 			return
@@ -120,7 +127,7 @@ type createRequest struct {
 	Options  string `json:"options"`
 }
 
-func createVolume(w http.ResponseWriter, r *http.Request, pluginName string) {
+func createVolume(w http.ResponseWriter, r *http.Request, cli *client.Client, pluginName string) {
 	var req createRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid json body", http.StatusBadRequest)
@@ -131,22 +138,33 @@ func createVolume(w http.ResponseWriter, r *http.Request, pluginName string) {
 		return
 	}
 
-	args := []string{"volume", "create", "-d", pluginName, "--name", req.Name, "-o", "host=" + req.Host, "-o", "export=" + req.Export}
+	opts := map[string]string{
+		"host":   req.Host,
+		"export": req.Export,
+	}
 	if req.Vers != "" {
-		args = append(args, "-o", "vers="+req.Vers)
+		opts["vers"] = req.Vers
 	}
 	if req.ReadOnly {
-		args = append(args, "-o", "ro=true")
+		opts["ro"] = "true"
 	}
 	if strings.TrimSpace(req.Options) != "" {
-		args = append(args, "-o", "options="+strings.TrimSpace(req.Options))
+		opts["options"] = strings.TrimSpace(req.Options)
 	}
 
-	if err := runDocker(args...); err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+	_, err := cli.VolumeCreate(ctx, volume.CreateOptions{
+		Driver:     pluginName,
+		Name:       req.Name,
+		DriverOpts: opts,
+		Labels:     map[string]string{"managed-by": "sevault-webui"},
+	})
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	info, err := dockerVolumeInspect(req.Name)
+	info, err := dockerVolumeInspect(cli, req.Name)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -154,69 +172,45 @@ func createVolume(w http.ResponseWriter, r *http.Request, pluginName string) {
 	writeJSON(w, info)
 }
 
-func dockerVolumeNames(pluginName string) ([]string, error) {
-	out, err := runDockerOutput("volume", "ls", "--filter", "driver="+pluginName, "--format", "{{.Name}}")
+func dockerVolumeNames(cli *client.Client, pluginName string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	args := filters.NewArgs()
+	args.Add("driver", pluginName)
+	list, err := cli.VolumeList(ctx, volume.ListOptions{Filters: args})
 	if err != nil {
 		return nil, err
 	}
 	var names []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		names = append(names, strings.TrimSpace(line))
+	for _, v := range list.Volumes {
+		names = append(names, v.Name)
 	}
 	return names, nil
 }
 
-func dockerVolumeInspect(name string) (volumeInfo, error) {
-	out, err := runDockerOutput("volume", "inspect", name)
+func dockerVolumeInspect(cli *client.Client, name string) (volumeInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	v, err := cli.VolumeInspect(ctx, name)
 	if err != nil {
 		return volumeInfo{}, err
 	}
-	var arr []struct {
-		Name       string                 `json:"Name"`
-		Driver     string                 `json:"Driver"`
-		Mountpoint string                 `json:"Mountpoint"`
-		Status     map[string]interface{} `json:"Status"`
-	}
-	if err := json.Unmarshal([]byte(out), &arr); err != nil {
-		return volumeInfo{}, err
-	}
-	if len(arr) == 0 {
-		return volumeInfo{}, fmt.Errorf("inspect returned no data for %s", name)
-	}
 	status := make(map[string]string)
-	for k, v := range arr[0].Status {
+	for k, v := range v.Status {
 		status[k] = fmt.Sprint(v)
 	}
 	return volumeInfo{
-		Name:       arr[0].Name,
-		Driver:     arr[0].Driver,
-		Mountpoint: arr[0].Mountpoint,
+		Name:       v.Name,
+		Driver:     v.Driver,
+		Mountpoint: v.Mountpoint,
 		Status:     status,
 	}, nil
 }
 
-func dockerVolumeRm(name string) error {
-	return runDocker("volume", "rm", name)
-}
-
-func runDocker(args ...string) error {
-	_, err := runDockerOutput(args...)
-	return err
-}
-
-func runDockerOutput(args ...string) (string, error) {
+func dockerVolumeRm(cli *client.Client, name string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("docker %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return string(out), nil
+	return cli.VolumeRemove(ctx, name, false)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
