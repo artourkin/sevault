@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 )
@@ -106,7 +105,7 @@ func listVolumes(w http.ResponseWriter, cli *client.Client, pluginName string) {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	var vols []volumeInfo
+	vols := make([]volumeInfo, 0)
 	for _, name := range names {
 		info, err := dockerVolumeInspect(cli, name)
 		if err != nil {
@@ -175,17 +174,23 @@ func createVolume(w http.ResponseWriter, r *http.Request, cli *client.Client, pl
 func dockerVolumeNames(cli *client.Client, pluginName string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 	defer cancel()
-	args := filters.NewArgs()
-	args.Add("driver", pluginName)
-	list, err := cli.VolumeList(ctx, volume.ListOptions{Filters: args})
+	list, err := cli.VolumeList(ctx, volume.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
 	var names []string
 	for _, v := range list.Volumes {
-		names = append(names, v.Name)
+		if driverMatches(pluginName, v.Driver) {
+			names = append(names, v.Name)
+		}
 	}
 	return names, nil
+}
+
+func driverMatches(pluginName, driver string) bool {
+	base := strings.SplitN(pluginName, ":", 2)[0]
+	d := strings.SplitN(driver, ":", 2)[0]
+	return strings.EqualFold(base, d)
 }
 
 func dockerVolumeInspect(cli *client.Client, name string) (volumeInfo, error) {
@@ -278,6 +283,10 @@ async function loadVolumes() {
   tbody.innerHTML = "";
   try {
     const vols = await fetchJSON("/api/volumes");
+    if (!Array.isArray(vols)) {
+      setMessage("Unexpected response");
+      return;
+    }
     vols.forEach(v => {
       const host = (v.status && v.status.host) || "";
       const exp = (v.status && v.status.export) || "";
