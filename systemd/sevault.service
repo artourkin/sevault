@@ -4,7 +4,7 @@ After=docker.service
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/bin/sevaultd nfs cifs
+ExecStart=/usr/bin/sevaultd
 Restart=always
 RestartSec=10
 

@@ -1,0 +1,10 @@
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY . .
+ENV CGO_ENABLED=0
+RUN go build -o /out/webui ./cmd/webui
+
+FROM scratch
+COPY --from=build /out/webui /webui
+EXPOSE 8080
+ENTRYPOINT ["/webui"]

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -12,124 +11,199 @@ import (
 	"github.com/docker/go-plugins-helpers/volume"
 )
 
-const (
-	stateRoot = "/var/lib/sevault"
-	mountRoot = stateRoot + "/mounts"
-)
+const mountRoot = "/var/lib/sevault/mounts"
 
-// Backend is implemented by each storage back‑end (NFS, CIFS, …).
-type Backend interface {
-	Prepare(vol string, opts map[string]string) (device string, options []string, err error)
-	FSType() string
-}
-
+// Driver is a tiny in-memory implementation of a Docker volume driver.
 type Driver struct {
 	mu      sync.Mutex
 	volumes map[string]*volumeInfo
-	backend Backend
 }
 
 type volumeInfo struct {
-	Name string
-	Path string
-	Opts map[string]string
+	name       string
+	mountpoint string
+	device     string
+	config     mountConfig
 }
 
-func New(b Backend) *Driver {
-	return &Driver{
-		volumes: make(map[string]*volumeInfo),
-		backend: b,
-	}
+type mountConfig struct {
+	host     string
+	export   string
+	version  string
+	readOnly bool
 }
 
-// Docker Volume Driver interface methods
+func New() *Driver {
+	return &Driver{volumes: make(map[string]*volumeInfo)}
+}
 
 func (d *Driver) Create(r *volume.CreateRequest) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if _, ok := d.volumes[r.Name]; ok {
-		log.Printf("[Create] Volume %s already exists", r.Name)
-		return nil
-	}
-	path := filepath.Join(mountRoot, r.Name)
-	if err := os.MkdirAll(path, 0o755); err != nil {
-		log.Printf("[Create] Failed to create directory %s: %v", path, err)
+	cfg, err := parseMountConfig(r.Options)
+	if err != nil {
 		return err
 	}
-	d.volumes[r.Name] = &volumeInfo{Name: r.Name, Path: path, Opts: r.Options}
-	log.Printf("[Create] Created volume %s at %s with Opts[%s]", r.Name, path, r.Options)
+
+	mountpoint := filepath.Join(mountRoot, r.Name)
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return err
+	}
+
+	info := &volumeInfo{
+		name:       r.Name,
+		mountpoint: mountpoint,
+		device:     fmt.Sprintf("%s:%s", formatHost(cfg.host), cfg.export),
+		config:     cfg,
+	}
+
+	d.mu.Lock()
+	d.volumes[r.Name] = info
+	d.mu.Unlock()
+	log.Printf("volume registered name=%s host=%s export=%s vers=%s ro=%t", r.Name, cfg.host, cfg.export, cfg.version, cfg.readOnly)
 	return nil
 }
 
 func (d *Driver) Remove(r *volume.RemoveRequest) error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	v, ok := d.volumes[r.Name]
-	if !ok {
-		log.Printf("[Remove] Volume %s not found", r.Name)
+	info := d.volumes[r.Name]
+	delete(d.volumes, r.Name)
+	d.mu.Unlock()
+
+	if info == nil {
 		return nil
 	}
-	_ = os.RemoveAll(v.Path)
-	delete(d.volumes, r.Name)
-	log.Printf("[Remove] Removed volume %s", r.Name)
+	_ = os.RemoveAll(info.mountpoint)
 	return nil
 }
 
 func (d *Driver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
-	d.mu.Lock()
-	v, ok := d.volumes[r.Name]
-	d.mu.Unlock()
-	if !ok {
-		log.Printf("[Path] Volume %s not found", r.Name)
-		return nil, fmt.Errorf("volume %s not found", r.Name)
+	info, err := d.lookup(r.Name)
+	if err != nil {
+		return nil, err
 	}
-	log.Printf("[Path] Volume %s mountpoint: %s", r.Name, v.Path)
-	return &volume.PathResponse{Mountpoint: v.Path}, nil
+	return &volume.PathResponse{Mountpoint: info.mountpoint}, nil
 }
 
 func (d *Driver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
-	d.mu.Lock()
-	v := d.volumes[r.Name]
-	d.mu.Unlock()
-	if v == nil {
-		log.Printf("[Mount] Unknown volume %s", r.Name)
-		return nil, fmt.Errorf("unknown volume %s", r.Name)
-	}
-	
-  
-  device, opts, err := d.backend.Prepare(r.Name, v.Opts)
-
-
+	info, err := d.lookup(r.Name)
 	if err != nil {
-		log.Printf("[Mount] Prepare failed for %s: %v", r.Name, err)
 		return nil, err
 	}
-	mountArgs := []string{"-t", d.backend.FSType(), "-o", strings.Join(opts, ","), device, v.Path}
-	log.Printf("[Mount] Running: mount %s", strings.Join(mountArgs, " "))
-	if out, err := exec.Command("mount", mountArgs...).CombinedOutput(); err != nil {
-		log.Printf("[Mount] mount failed: %v (%s)", err, string(out))
-		return nil, fmt.Errorf("mount failed: %v (%s)", err, string(out))
+
+	if err := os.MkdirAll(info.mountpoint, 0o755); err != nil {
+		return nil, err
 	}
-	log.Printf("[Mount] Mounted %s at %s", r.Name, v.Path)
-	return &volume.MountResponse{Mountpoint: v.Path}, nil
+
+	flags, data := mountArguments(info.config)
+	if err := mountVolume(info.device, info.mountpoint, "nfs", flags, data); err != nil {
+		return nil, fmt.Errorf("mount %s -> %s failed: %w", info.device, info.mountpoint, err)
+	}
+	log.Printf("volume mounted name=%s target=%s", info.name, info.mountpoint)
+	return &volume.MountResponse{Mountpoint: info.mountpoint}, nil
 }
 
 func (d *Driver) Unmount(r *volume.UnmountRequest) error {
-	mountPath := filepath.Join(mountRoot, r.Name)
-	log.Printf("[Unmount] Unmounting %s", mountPath)
-	err := exec.Command("umount", mountPath).Run()
-	if err != nil {
-		log.Printf("[Unmount] Failed to unmount %s: %v", mountPath, err)
-	} else {
-		log.Printf("[Unmount] Unmounted %s", mountPath)
+	target := filepath.Join(mountRoot, r.Name)
+	if err := unmountVolume(target); err != nil {
+		return fmt.Errorf("unmount %s failed: %w", r.Name, err)
 	}
-	return err
+	log.Printf("volume unmounted name=%s", r.Name)
+	return nil
 }
 
-func (d *Driver) Get(req *volume.GetRequest) (*volume.GetResponse, error) { /* … */ return nil, nil }
-func (d *Driver) List() (*volume.ListResponse, error)                     { /* … */ return nil, nil }
+func (d *Driver) Get(r *volume.GetRequest) (*volume.GetResponse, error) {
+	info, err := d.lookup(r.Name)
+	if err != nil {
+		return nil, err
+	}
+	return &volume.GetResponse{Volume: describeVolume(info)}, nil
+}
+
+func (d *Driver) List() (*volume.ListResponse, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var volumes []*volume.Volume
+	for _, info := range d.volumes {
+		volumes = append(volumes, describeVolume(info))
+	}
+	return &volume.ListResponse{Volumes: volumes}, nil
+}
+
 func (d *Driver) Capabilities() *volume.CapabilitiesResponse {
 	return &volume.CapabilitiesResponse{Capabilities: volume.Capability{Scope: "global"}}
 }
 
-func optsToString(o []string) string { return fmt.Sprintf("%s", o) } // simple joiner for options
+func (d *Driver) lookup(name string) (*volumeInfo, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	info, ok := d.volumes[name]
+	if !ok {
+		return nil, fmt.Errorf("volume %s not found", name)
+	}
+	return info, nil
+}
+
+func describeVolume(info *volumeInfo) *volume.Volume {
+	status := map[string]interface{}{
+		"host":   info.config.host,
+		"export": info.config.export,
+		"vers":   info.config.version,
+		"ro":     info.config.readOnly,
+	}
+	return &volume.Volume{
+		Name:       info.name,
+		Mountpoint: info.mountpoint,
+		Status:     status,
+	}
+}
+
+func parseMountConfig(opts map[string]string) (mountConfig, error) {
+	cfg := mountConfig{
+		host:     strings.TrimSpace(opts["host"]),
+		export:   strings.TrimSpace(opts["export"]),
+		version:  strings.TrimSpace(opts["vers"]),
+		readOnly: isTrue(opts["ro"]),
+	}
+
+	if cfg.host == "" || cfg.export == "" {
+		return mountConfig{}, fmt.Errorf("host and export options are required")
+	}
+
+	if cfg.version == "" {
+		cfg.version = "4"
+	}
+
+	return cfg, nil
+}
+
+func mountArguments(cfg mountConfig) (uintptr, string) {
+	var flags uintptr
+	if cfg.readOnly {
+		flags |= mountFlagReadOnly
+	}
+
+	options := []string{
+		fmt.Sprintf("addr=%s", cfg.host),
+		fmt.Sprintf("vers=%s", cfg.version),
+		"nolock", // statd is not running inside the plugin rootfs
+	}
+
+	return flags, strings.Join(options, ",")
+}
+
+func formatHost(host string) string {
+	if strings.Contains(host, ":") && !strings.Contains(host, "]") {
+		return "[" + host + "]"
+	}
+	return host
+}
+
+func isTrue(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}

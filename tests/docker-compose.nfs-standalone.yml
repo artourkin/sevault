@@ -1,0 +1,71 @@
+services:
+  nfs-server:
+    image: ${TESTS_NFS_SERVER_IMAGE:-erichough/nfs-server:latest}
+    platform: linux/amd64
+    privileged: true
+    environment:
+      NFS_EXPORT_0: "${TESTS_EXPORT_PATH:-/exports} *(rw,sync,no_subtree_check,no_root_squash)"
+    volumes:
+      - nfs-export:${TESTS_EXPORT_PATH:-/exports}:rw
+    networks:
+      - standalone-nfs-net
+
+  nfs-client:
+    image: ${TESTS_NFS_CLIENT_IMAGE:-alpine:3.20}
+    privileged: true
+    depends_on:
+      - nfs-server
+    networks:
+      - standalone-nfs-net
+    environment:
+      NFS_SERVER_HOST: ${TESTS_NFS_SERVER_HOST:-nfs-server}
+      EXPORT_PATH: ${TESTS_EXPORT_PATH:-/exports}
+      CLIENT_TEST_FILE: ${TESTS_TEST_FILENAME:-standalone-nfs-test.txt}
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -eu
+        apk add --no-cache nfs-utils >/dev/null
+          mount_dir=/mnt/test
+          mkdir -p "$${mount_dir}"
+        echo "CLIENT: Mounting $${NFS_SERVER_HOST}:$${EXPORT_PATH}..."
+          mount -t nfs -o rw,vers=3,nolock "$${NFS_SERVER_HOST}:$${EXPORT_PATH}" "$${mount_dir}"
+        echo "CLIENT: Writing $${CLIENT_TEST_FILE}..."
+          printf "Standalone NFS connectivity test %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$${mount_dir}/$${CLIENT_TEST_FILE}"
+        sync
+        echo "CLIENT: Listing files in share:"
+          ls -l "$${mount_dir}"
+        echo "CLIENT: Reading file contents:"
+          cat "$${mount_dir}/$${CLIENT_TEST_FILE}"
+          umount "$${mount_dir}"
+        echo "CLIENT: Unmounted successfully."
+
+  nfs-checker:
+    image: ${TESTS_NFS_CHECKER_IMAGE:-alpine:3.20}
+    depends_on:
+      - nfs-client
+    networks:
+      - standalone-nfs-net
+    volumes:
+      - nfs-export:${TESTS_EXPORT_PATH:-/exports}:ro
+    environment:
+      EXPORT_PATH: ${TESTS_EXPORT_PATH:-/exports}
+      CLIENT_TEST_FILE: ${TESTS_TEST_FILENAME:-standalone-nfs-test.txt}
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -eu
+        echo "CHECKER: Listing $${EXPORT_PATH}..."
+        ls -l "$${EXPORT_PATH}"
+        echo "CHECKER: File contents:"
+        cat "$${EXPORT_PATH}/$${CLIENT_TEST_FILE}"
+
+networks:
+  standalone-nfs-net:
+    name: ${TESTS_NETWORK_NAME:-standalone-nfs-net}
+
+volumes:
+  nfs-export:
+    name: ${TESTS_NFS_EXPORT_VOLUME:-standalone-nfs-volume}

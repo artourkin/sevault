@@ -1,0 +1,50 @@
+services:
+  test-nfs-server:
+    image: ${TESTS_NFS_SERVER_IMAGE:-erichough/nfs-server:latest}
+    platform: linux/amd64
+    privileged: true
+    environment:
+      NFS_EXPORT_0: "${TESTS_NFS_EXPORT_PATH:-/exports} *(rw,sync,no_subtree_check,no_root_squash)"
+    volumes:
+      - nfs-export:${TESTS_NFS_EXPORT_PATH:-/exports}:rw
+    networks:
+      - plugin-test-net
+
+  test-nfs-client:
+    image: ${TESTS_CLIENT_IMAGE:-alpine:3.20}
+    depends_on:
+      - test-nfs-server
+    networks:
+      - plugin-test-net
+    volumes:
+      - testvol:/mnt
+    command: |
+      sh -c "
+        echo 'CLIENT: Waiting a bit for volume to be ready...'
+        sleep 3
+        echo 'CLIENT: Attempting to write to /mnt/testfile.txt...'
+        touch /mnt/testfile.txt && \
+        echo 'CLIENT: Successfully created /mnt/testfile.txt.' && \
+        echo 'Test data from Sevault NFS volume' > /mnt/testfile.txt && \
+        echo 'CLIENT: Successfully wrote to /mnt/testfile.txt.' && \
+        echo 'CLIENT: Content of /mnt/testfile.txt:' && \
+        cat /mnt/testfile.txt && \
+        ls -l /mnt && \
+        echo 'CLIENT: Test successful!' || \
+        (echo 'CLIENT: Test FAILED.' && exit 1)
+      "
+
+volumes:
+  nfs-export:
+    name: ${TESTS_NFS_EXPORT_VOLUME:-sevault-test-nfs-share}
+  testvol:
+    driver: ${TESTS_PLUGIN_NAME:-sevault}
+    driver_opts:
+      host: "${TESTS_NFS_SERVER_IP}"
+      export: "${TESTS_NFS_EXPORT_PATH:-/exports}"
+      vers: "${TESTS_NFS_VERSION:-3}"
+      type: "nfs"
+
+networks:
+  plugin-test-net:
+    name: ${TESTS_NETWORK_NAME:-test-plugin-net}

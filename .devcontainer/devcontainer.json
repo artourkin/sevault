@@ -1,0 +1,14 @@
+{
+  "name": "amd64-ubuntu-dev",
+  "image": "ubuntu:22.04",
+  "remoteUser": "root",
+  "updateRemoteUserUID": false,
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/go:1": {},
+        "ghcr.io/devcontainers/features/sshd:1": {}
+  },
+  "containerEnv": {
+    "DOCKER_DEFAULT_PLATFORM": "linux/amd64"
+  }
+}
